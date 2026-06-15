@@ -24,7 +24,7 @@ workflows:
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_SCHEME: App
         # App Store Connect → Apps → PCPTherapy → General → App Information → Apple ID
-        APP_STORE_APPLE_ID: 0
+        APP_STORE_APPLE_ID: 6770956276
       node: 22
       xcode: latest
       cocoapods: default

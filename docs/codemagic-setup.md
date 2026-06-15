@@ -56,10 +56,22 @@ Uploader certificat `.p12` + profil `.mobileprovision` App Store avec les mêmes
 3. Copier cet ID dans `codemagic.yaml` :
 
 ```yaml
-APP_STORE_APPLE_ID: 6750123456   # remplacer 0
+APP_STORE_APPLE_ID: 6770956276
 ```
 
 4. **TestFlight** → créer un groupe testeurs (ex. `Internal Testers`) — même nom que dans `beta_groups` du YAML.
+
+### Clé API App Store Connect (PCP INNOV)
+
+| Champ | Valeur |
+|-------|--------|
+| Nom dans Apple | `pcp` |
+| Issuer ID | `04c9e428-5053-4729-bc5f-13614249776d` |
+| Key ID | `2UGWQSWK52` |
+| Accès | Admin |
+| Fichier | `AuthKey_2UGWQSWK52.p8` (téléchargé une seule fois) |
+
+Dans Codemagic → **Team integrations** → nom **`PCP_AppStoreConnect`** (nom Codemagic, pas le nom Apple).
 
 > La **toute première** version peut exiger un upload manuel ou la complétion de métadonnées (privacy URL, catégorie) dans App Store Connect.
 
