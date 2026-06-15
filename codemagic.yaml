@@ -91,12 +91,7 @@ workflows:
       - /tmp/xcodebuild_logs/*.log
 
     publishing:
-      email:
-        recipients:
-          - $CM_BUILD_AUTHOR_EMAIL
-        notify:
-          success: true
-          failure: true
+      # Notifications email : les activer dans Codemagic UI → app → Notifications
       app_store_connect:
         auth: integration
         submit_to_testflight: true
