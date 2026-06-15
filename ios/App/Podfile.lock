@@ -1,0 +1,28 @@
+PODS:
+  - Capacitor (8.3.4):
+    - CapacitorCordova
+  - CapacitorCordova (8.3.4)
+  - CapgoCapacitorHealth (8.6.0):
+    - Capacitor
+
+DEPENDENCIES:
+  - "Capacitor (from `../../node_modules/@capacitor/ios`)"
+  - "CapacitorCordova (from `../../node_modules/@capacitor/ios`)"
+  - "CapgoCapacitorHealth (from `../../node_modules/@capgo/capacitor-health`)"
+
+EXTERNAL SOURCES:
+  Capacitor:
+    :path: "../../node_modules/@capacitor/ios"
+  CapacitorCordova:
+    :path: "../../node_modules/@capacitor/ios"
+  CapgoCapacitorHealth:
+    :path: "../../node_modules/@capgo/capacitor-health"
+
+SPEC CHECKSUMS:
+  Capacitor: 64a14f6a0638fc6b6ec7c751b04fd86688c78596
+  CapacitorCordova: c07921bdcfec6f691bae22274446b4d606ebf6a4
+  CapgoCapacitorHealth: 3346e29dfe2503a1a25c6e0ee4f23b638fda2051
+
+PODFILE CHECKSUM: db11f9e2936499aa46b82c41cc67f83174f3041a
+
+COCOAPODS: 1.16.2

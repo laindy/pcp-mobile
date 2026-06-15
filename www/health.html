@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Santé · PCPTherapy</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="page-header">
+      <button
+        type="button"
+        class="back-button"
+        onclick="if (window.AndroidBridge && window.AndroidBridge.close) { window.AndroidBridge.close(); } else { window.history.length > 1 ? window.history.back() : window.close(); }"
+        aria-label="Retour"
+      >
+        <span class="back-icon" aria-hidden="true">‹</span>
+        <span class="back-label">Santé connectée</span>
+      </button>
+    </header>
+
+    <main class="page-content">
+      <section class="intro">
+        <p>
+          Cette page est un <strong>panneau de contrôle debug</strong>. La sync
+          Health Connect tourne automatiquement en arrière-plan toutes les 6 h
+          via WorkManager — aucune lecture n'est faite depuis cette page
+          (zéro impact sur le quota Health Connect).
+        </p>
+      </section>
+
+      <h2 class="section-title">Permissions Health Connect</h2>
+      <div id="status" class="status-card is-warning">
+        <span class="dot"></span>
+        <span id="status-text">Vérification des permissions…</span>
+      </div>
+
+      <div class="action-row">
+        <button id="btn-request" class="btn btn-primary" disabled>
+          <span class="btn-label">Demander / vérifier les permissions</span>
+        </button>
+      </div>
+
+      <h2 class="section-title">Sync native vers le backend</h2>
+      <div class="backend-card">
+        <div id="backend-status" class="status-card is-warning">
+          <span class="dot"></span>
+          <span id="backend-status-text">Chargement…</span>
+        </div>
+
+        <div class="field-group">
+          <label for="api-base">URL API (override optionnel)</label>
+          <input
+            id="api-base"
+            type="url"
+            placeholder="https://patient.pcpinnov.com"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+          <button id="btn-save-base" class="btn btn-secondary">
+            <span class="btn-label">Mémoriser l'URL</span>
+          </button>
+        </div>
+
+        <!--
+          Section login désactivée — en production le token NextAuth est
+          capté automatiquement par le SessionInterceptor natif (cf.
+          android/app/src/main/java/.../health/SessionInterceptor.java).
+          Décommenter ce bloc + restaurer handleLogin() dans health.js pour
+          forcer un token manuellement pendant le développement.
+
+        <details id="login-section">
+          <summary>Forcer un token patient (debug)</summary>
+          <div class="field-group">
+            <label for="login-email">Email</label>
+            <input id="login-email" type="email" autocomplete="email" autocapitalize="off" spellcheck="false" />
+          </div>
+          <div class="field-group">
+            <label for="login-password">Mot de passe</label>
+            <input id="login-password" type="password" autocomplete="current-password" />
+          </div>
+          <button id="btn-login" class="btn btn-primary">
+            <span class="btn-label">Se connecter et enregistrer le token</span>
+          </button>
+        </details>
+        -->
+
+        <small class="field-hint">
+          En production : le token est posé automatiquement par le
+          <code>SessionInterceptor</code> natif après le login NextAuth.
+          La sync tourne ensuite toutes les 6 h en background — aucune
+          action utilisateur requise.
+        </small>
+
+        <div class="action-row">
+          <button id="btn-sync-now" class="btn btn-primary">
+            <span class="btn-label">Déclencher la sync maintenant</span>
+          </button>
+          <button id="btn-clear-token" class="btn btn-secondary">
+            <span class="btn-label">Effacer token (logout)</span>
+          </button>
+        </div>
+
+        <pre class="debug" id="backend-result">État du worker natif :</pre>
+      </div>
+
+      <h2 class="section-title">Données stockées côté backend</h2>
+      <div class="backend-card">
+        <p class="field-hint" style="margin: 0">
+          Lit les endpoints <code>/api/v1/patients/me/health/*</code> en utilisant
+          le JWT chiffré côté natif (le token ne transite jamais par le JS).
+        </p>
+        <div class="action-row" id="fetch-buttons">
+          <button class="btn btn-primary" data-fetch="/api/v1/patients/me/health/samples?data_type=weight&page_size=100" data-view="samples" data-label="Poids">
+            <span class="btn-label">Poids</span>
+          </button>
+          <button class="btn btn-primary" data-fetch="/api/v1/patients/me/health/samples?data_type=heartRate&page_size=100" data-view="samples" data-label="Fréquence cardiaque">
+            <span class="btn-label">FC</span>
+          </button>
+          <button class="btn btn-primary" data-fetch="/api/v1/patients/me/health/daily?limit=30" data-view="daily" data-label="Pas / distance / calories par jour">
+            <span class="btn-label">Pas/Dist/Cal (30j)</span>
+          </button>
+          <button class="btn btn-secondary" data-fetch="/api/v1/patients/me/health/vitals/latest" data-view="json">
+            <span class="btn-label">Vitals</span>
+          </button>
+          <button class="btn btn-secondary" data-fetch="/api/v1/patients/me/health/sync-batches?page_size=10" data-view="json">
+            <span class="btn-label">Sync batches</span>
+          </button>
+          <button class="btn btn-secondary" data-fetch="/api/v1/patients/me/health/workouts?page_size=10" data-view="json">
+            <span class="btn-label">Workouts</span>
+          </button>
+        </div>
+        <div id="fetch-result-pretty"></div>
+        <pre class="debug" id="fetch-result">Sélectionne une ressource ci-dessus.</pre>
+      </div>
+
+      <h2 class="section-title">Logs</h2>
+      <pre class="debug" id="debug">En attente…</pre>
+    </main>
+
+    <script src="health-daily-aggregates.js"></script>
+    <script src="health.js"></script>
+  </body>
+</html>

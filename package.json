@@ -1,0 +1,28 @@
+{
+  "name": "pcpttherapy-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Plateforme de suivi thérapeutique PCP",
+  "scripts": {
+    "generate:icons": "node scripts/generate-app-icons.mjs",
+    "cap:sync": "cap sync",
+    "cap:open:android": "cap open android",
+    "cap:open:ios": "cap open ios",
+    "cap:run:android": "cap run android",
+    "cap:run:ios": "cap run ios"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.3.4",
+    "@capacitor/core": "^8.3.4",
+    "@capacitor/ios": "^8.3.4",
+    "@capgo/capacitor-health": "^8.6.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.3.4",
+    "sharp": "^0.34.5",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,13 @@
+<!-- Matches frontend auth layout: rounded-2xl tile primary/10 + medical_services primary #0f5af0. Glyph: Material Symbols medical_services. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="108" height="108" viewBox="0 0 108 108">
+  <path
+    fill="#E7EEFE"
+    d="M 37,26 L 71,26 A 11,11 0 0 1 82,37 L 82,71 A 11,11 0 0 1 71,82 L 37,82 A 11,11 0 0 1 26,71 L 26,37 A 11,11 0 0 1 37,26 Z"
+  />
+  <g transform="translate(54,54) scale(0.052) translate(-480,480)">
+    <path
+      fill="#0F5AF0"
+      d="M160-80q-33 0-56.5-23.5T80-160v-480q0-33 23.5-56.5T160-720h160v-80q0-33 23.5-56.5T400-880h160q33 0 56.5 23.5T640-800v80h160q33 0 56.5 23.5T880-640v480q0 33-23.5 56.5T800-80H160Zm0-80h640v-480H160v480Zm240-560h160v-80H400v80ZM160-160v-480 480Zm280-200v120h80v-120h120v-80H520v-120h-80v120H320v80h120Z"
+    />
+  </g>
+</svg>

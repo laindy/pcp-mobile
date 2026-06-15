@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="fr" class="offline-page">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f5f6f8" />
+    <title>PCPTherapy</title>
+    <style>
+      /* Styles intégrés — sur Android (server.url distant) styles.css passe par le
+         proxy réseau et échoue hors-ligne ; seul offline.html est servi localement. */
+      :root {
+        --color-primary: #0f5af0;
+        --color-primary-light: #e7eefe;
+        --color-card: #ffffff;
+        --color-text: #111827;
+        --color-text-muted: #6b7280;
+        --color-border: #e5e7eb;
+        --radius-md: 12px;
+        --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.06);
+        --pcp-safe-top: env(safe-area-inset-top, 0px);
+        --pcp-safe-bottom: env(safe-area-inset-bottom, 0px);
+      }
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+      }
+      html.offline-page {
+        height: 100%;
+        width: 100%;
+      }
+      html.offline-page,
+      html.offline-page body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        background: #f5f6f8 !important;
+        color: #111827;
+        color-scheme: light only;
+        overscroll-behavior-y: none;
+      }
+      .offline-body {
+        min-height: 100vh;
+        min-height: 100dvh;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        font-size: 16px;
+        line-height: 1.4;
+        -webkit-font-smoothing: antialiased;
+        background: linear-gradient(
+          165deg,
+          #f5f8ff 0%,
+          #f5f6f8 42%,
+          #eef2f7 100%
+        ) !important;
+        overflow-x: hidden;
+        overscroll-behavior-y: none;
+      }
+      .offline-pull {
+        position: fixed;
+        top: max(var(--pcp-safe-top, env(safe-area-inset-top, 0px)), 10px);
+        left: 0;
+        right: 0;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6px;
+        opacity: 0;
+        pointer-events: none;
+        color: var(--color-primary);
+        transition: opacity 0.15s ease;
+      }
+      .offline-pull.is-visible,
+      .offline-pull.is-ready,
+      .offline-pull.is-active {
+        opacity: 1;
+      }
+      .offline-pull-icon {
+        width: 26px;
+        height: 26px;
+        display: block;
+        transform-origin: center center;
+        will-change: transform;
+      }
+      .offline-pull.is-ready .offline-pull-icon {
+        color: var(--color-primary);
+      }
+      .offline-pull.is-active .offline-pull-icon {
+        animation: offline-spin 0.75s linear infinite;
+      }
+      .offline-screen {
+        min-height: calc(100vh + 1px);
+        min-height: calc(100dvh + 1px);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: max(var(--pcp-safe-top, env(safe-area-inset-top, 0px)), 24px)
+          24px max(var(--pcp-safe-bottom, env(safe-area-inset-bottom, 0px)), 24px);
+        gap: 28px;
+      }
+      .offline-brand {
+        text-align: center;
+      }
+      .offline-logo {
+        width: 72px;
+        height: 72px;
+        margin: 0 auto 10px;
+      }
+      .offline-logo-mark {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .offline-app-name {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--color-text-muted);
+      }
+      .offline-card {
+        width: 100%;
+        max-width: 380px;
+        background: var(--color-card);
+        border: 1px solid var(--color-border);
+        border-radius: 20px;
+        padding: 28px 24px 24px;
+        box-shadow: 0 8px 32px rgba(15, 90, 240, 0.08), var(--shadow-card);
+        text-align: center;
+      }
+      .offline-icon-wrap {
+        width: 56px;
+        height: 56px;
+        margin: 0 auto 18px;
+        border-radius: 16px;
+        background: var(--color-primary-light);
+        color: var(--color-primary);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .offline-icon {
+        width: 28px;
+        height: 28px;
+      }
+      .offline-title {
+        margin: 0 0 10px;
+        font-size: 22px;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        line-height: 1.25;
+        color: var(--color-text);
+      }
+      .offline-message {
+        margin: 0 0 22px;
+        font-size: 15px;
+        line-height: 1.5;
+        color: var(--color-text-muted);
+      }
+      .offline-btn {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: 100%;
+        min-height: 52px;
+        padding: 14px 20px;
+        border: none;
+        border-radius: var(--radius-md);
+        background: var(--color-primary);
+        color: #fff;
+        font-size: 17px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 0.05s ease, opacity 0.15s ease;
+      }
+      .offline-btn-icon {
+        width: 20px;
+        height: 20px;
+        flex-shrink: 0;
+      }
+      .offline-btn.is-loading .offline-btn-icon {
+        opacity: 0;
+      }
+      .offline-btn:active:not(:disabled) {
+        transform: scale(0.985);
+      }
+      .offline-btn:disabled {
+        opacity: 0.85;
+        cursor: wait;
+      }
+      .offline-btn-label {
+        transition: opacity 0.15s ease;
+      }
+      .offline-spinner {
+        position: absolute;
+        width: 20px;
+        height: 20px;
+        border: 2.5px solid rgba(255, 255, 255, 0.35);
+        border-top-color: #fff;
+        border-radius: 50%;
+        opacity: 0;
+        animation: offline-spin 0.75s linear infinite;
+      }
+      .offline-btn.is-loading .offline-btn-label {
+        opacity: 0;
+      }
+      .offline-btn.is-loading .offline-spinner {
+        opacity: 1;
+      }
+      @keyframes offline-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .offline-hint {
+        margin: 16px 0 0;
+        font-size: 13px;
+        line-height: 1.45;
+        color: var(--color-text-muted);
+      }
+    </style>
+  </head>
+  <body class="offline-body">
+    <div id="offline-pull" class="offline-pull" aria-hidden="true">
+      <svg
+        class="offline-pull-icon"
+        viewBox="0 0 24 24"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <path
+          d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+    </div>
+
+    <main class="offline-screen" role="main" id="offline-scroll">
+      <div class="offline-brand" aria-hidden="true">
+        <div class="offline-logo">
+          <svg
+            class="offline-logo-mark"
+            viewBox="0 0 48 48"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <rect width="48" height="48" rx="14" fill="#E7EEFE" />
+            <path
+              d="M24 10c-7.18 0-13 5.82-13 13 0 4.55 2.33 8.55 5.87 10.9L14 38h20l-2.87-4.1C35.67 31.55 37 27.55 37 23c0-7.18-5.82-13-13-13Z"
+              fill="#0F5AF0"
+            />
+            <path
+              d="M16 24h16M24 16v16"
+              stroke="#fff"
+              stroke-width="2.5"
+              stroke-linecap="round"
+            />
+          </svg>
+        </div>
+        <p class="offline-app-name">PCPTherapy</p>
+      </div>
+
+      <div class="offline-card">
+        <div class="offline-icon-wrap" aria-hidden="true">
+          <svg
+            class="offline-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M12 20h.01M8.5 16.429a5.5 5.5 0 0 1 7 0M5 12.859a10 10 0 0 1 14 0M2 9.289a15 15 0 0 1 20 0"
+              stroke="currentColor"
+              stroke-width="1.75"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+            <path
+              d="m4 4 16 16"
+              stroke="currentColor"
+              stroke-width="1.75"
+              stroke-linecap="round"
+            />
+          </svg>
+        </div>
+
+        <h1 id="offline-title" class="offline-title">Connexion indisponible</h1>
+        <p id="offline-message" class="offline-message">
+          Impossible de joindre le serveur. Vérifiez votre connexion internet ou
+          réessayez dans quelques instants.
+        </p>
+
+        <button
+          id="offline-retry"
+          type="button"
+          class="offline-btn"
+          aria-live="polite"
+        >
+          <svg
+            class="offline-btn-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          <span id="offline-retry-label" class="offline-btn-label">Actualiser</span>
+          <span class="offline-spinner" aria-hidden="true"></span>
+        </button>
+
+        <p id="offline-hint" class="offline-hint">
+          Tirez vers le bas ou touchez «&nbsp;Actualiser&nbsp;» pour réessayer.
+        </p>
+      </div>
+    </main>
+
+    <script>
+      (function () {
+        var APP_URL = "https://patient.pcpinnov.com/";
+        var RETRY_TIMEOUT_MS = 25000;
+        var PULL_THRESHOLD = 72;
+
+        var I18N = {
+          fr: {
+            title: "Connexion indisponible",
+            message:
+              "Impossible de joindre le serveur. Vérifiez votre connexion internet ou réessayez dans quelques instants.",
+            retry: "Actualiser",
+            retrying: "Connexion…",
+            hint: "Tirez vers le bas ou touchez « Actualiser » pour réessayer.",
+          },
+          en: {
+            title: "No connection",
+            message:
+              "Unable to reach the server. Check your internet connection or try again in a moment.",
+            retry: "Refresh",
+            retrying: "Connecting…",
+            hint: "Pull down or tap Refresh to try again.",
+          },
+        };
+
+        var lang = (navigator.language || "fr").toLowerCase().startsWith("en")
+          ? "en"
+          : "fr";
+        var t = I18N[lang];
+        document.documentElement.lang = lang;
+
+        var titleEl = document.getElementById("offline-title");
+        var messageEl = document.getElementById("offline-message");
+        var hintEl = document.getElementById("offline-hint");
+        var btn = document.getElementById("offline-retry");
+        var btnLabel = document.getElementById("offline-retry-label");
+        var pullEl = document.getElementById("offline-pull");
+        var pullIcon = pullEl ? pullEl.querySelector(".offline-pull-icon") : null;
+        var retryTimer = null;
+        var isRefreshing = false;
+        var touchStartY = 0;
+        var pullDistance = 0;
+        var pullReady = false;
+
+        window.__pcpSetSafeAreaInsets = function (topPx, bottomPx) {
+          var top = Math.max(0, Number(topPx) || 0);
+          var bottom = Math.max(0, Number(bottomPx) || 0);
+          document.documentElement.style.setProperty(
+            "--pcp-safe-top",
+            top + "px"
+          );
+          document.documentElement.style.setProperty(
+            "--pcp-safe-bottom",
+            bottom + "px"
+          );
+        };
+
+        titleEl.textContent = t.title;
+        messageEl.textContent = t.message;
+        hintEl.textContent = t.hint;
+        btnLabel.textContent = t.retry;
+
+        function triggerPullHaptic() {
+          try {
+            if (
+              window.PcpHealthBridge &&
+              window.PcpHealthBridge.playLightHaptic
+            ) {
+              window.PcpHealthBridge.playLightHaptic();
+              return;
+            }
+          } catch (_) {}
+          if (
+            !window.webkit ||
+            !window.webkit.messageHandlers ||
+            !window.webkit.messageHandlers.pcpHealthHaptic
+          ) {
+            return;
+          }
+          try {
+            window.webkit.messageHandlers.pcpHealthHaptic.postMessage("light");
+          } catch (_) {}
+        }
+
+        function scrollTop() {
+          return (
+            window.scrollY ||
+            document.documentElement.scrollTop ||
+            document.body.scrollTop ||
+            0
+          );
+        }
+
+        function setLoading(loading, opts) {
+          opts = opts || {};
+          isRefreshing = loading;
+          btn.disabled = loading;
+          if (opts.showPull && pullEl) {
+            btn.classList.remove("is-loading");
+            btnLabel.textContent = t.retry;
+            pullEl.classList.toggle("is-active", loading);
+          } else {
+            btn.classList.toggle("is-loading", loading);
+            btnLabel.textContent = loading ? t.retrying : t.retry;
+            if (!loading) resetPull();
+          }
+        }
+
+        function clearRetryTimer() {
+          if (retryTimer) {
+            clearTimeout(retryTimer);
+            retryTimer = null;
+          }
+        }
+
+        function reloadViaNative() {
+          try {
+            if (
+              window.PcpOfflineBridge &&
+              typeof window.PcpOfflineBridge.reloadApp === "function"
+            ) {
+              window.PcpOfflineBridge.reloadApp();
+              return true;
+            }
+          } catch (_) {}
+
+          try {
+            if (
+              window.webkit &&
+              window.webkit.messageHandlers &&
+              window.webkit.messageHandlers.pcpOfflineReload
+            ) {
+              window.webkit.messageHandlers.pcpOfflineReload.postMessage({});
+              return true;
+            }
+          } catch (_) {}
+
+          return false;
+        }
+
+        function reloadApp(fromPull) {
+          if (isRefreshing) return;
+          clearRetryTimer();
+          setLoading(true, { showPull: !!fromPull });
+          retryTimer = setTimeout(function () {
+            setLoading(false, { showPull: !!fromPull });
+          }, RETRY_TIMEOUT_MS);
+
+          if (!reloadViaNative()) {
+            window.location.replace(APP_URL);
+          }
+        }
+
+        function resetPull() {
+          pullDistance = 0;
+          pullReady = false;
+          if (!pullEl) return;
+          pullEl.classList.remove("is-ready", "is-active", "is-visible");
+          if (pullIcon) {
+            pullIcon.style.transform = "rotate(0deg) scale(1)";
+          }
+        }
+
+        function updatePull(distance) {
+          if (!pullEl || !pullIcon) return;
+          var clamped = Math.max(0, Math.min(distance, PULL_THRESHOLD * 1.5));
+          pullDistance = clamped;
+          pullEl.classList.toggle("is-visible", clamped > 4);
+          pullReady = clamped >= PULL_THRESHOLD;
+          pullEl.classList.toggle("is-ready", pullReady);
+          var progress = Math.min(1, clamped / PULL_THRESHOLD);
+          var deg = progress * 180;
+          var scale = 0.85 + progress * 0.15;
+          pullIcon.style.transform =
+            "rotate(" + deg + "deg) scale(" + scale.toFixed(2) + ")";
+        }
+
+        function onTouchStart(event) {
+          if (isRefreshing || !event.touches.length) return;
+          if (scrollTop() > 4) return;
+          touchStartY = event.touches[0].clientY;
+        }
+
+        function onTouchMove(event) {
+          if (isRefreshing || touchStartY === 0 || !event.touches.length) return;
+          if (scrollTop() > 4) {
+            resetPull();
+            touchStartY = 0;
+            return;
+          }
+          var delta = event.touches[0].clientY - touchStartY;
+          if (delta > 0) {
+            event.preventDefault();
+            updatePull(delta * 0.6);
+          } else if (delta < -8) {
+            resetPull();
+            touchStartY = 0;
+          }
+        }
+
+        function onTouchEnd() {
+          if (isRefreshing) return;
+          if (pullReady) {
+            triggerPullHaptic();
+            reloadApp(true);
+          } else {
+            resetPull();
+          }
+          touchStartY = 0;
+        }
+
+        btn.addEventListener("click", function () {
+          reloadApp(false);
+        });
+        window.addEventListener("online", function () {
+          reloadApp(false);
+        });
+
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState === "visible" && navigator.onLine) {
+            reloadApp(false);
+          }
+        });
+
+        document.addEventListener("touchstart", onTouchStart, { passive: true });
+        document.addEventListener("touchmove", onTouchMove, { passive: false });
+        document.addEventListener("touchend", onTouchEnd, { passive: true });
+        document.addEventListener("touchcancel", onTouchEnd, { passive: true });
+      })();
+    </script>
+  </body>
+</html>
