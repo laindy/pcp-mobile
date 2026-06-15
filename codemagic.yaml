@@ -17,9 +17,12 @@ workflows:
       app_store_connect: PCP_AppStoreConnect
 
     environment:
+      # Reference names = exactement ceux de Settings → Code signing identities
       ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.pcpinnov.patient
+        certificates:
+          - certificate: pcp_distribution
+        provisioning_profiles:
+          - profile: pcp_appstore
       vars:
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_SCHEME: App
@@ -109,8 +112,10 @@ workflows:
 
     environment:
       ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.pcpinnov.patient
+        certificates:
+          - certificate: pcp_distribution
+        provisioning_profiles:
+          - profile: pcp_appstore
       vars:
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_SCHEME: App
