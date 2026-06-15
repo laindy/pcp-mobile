@@ -22,7 +22,7 @@ workflows:
         certificates:
           - certificate: pcp_distribution
         provisioning_profiles:
-          - profile: pcp_appstore
+          - profile: pcp_distribution
       vars:
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_SCHEME: App
@@ -115,7 +115,7 @@ workflows:
         certificates:
           - certificate: pcp_distribution
         provisioning_profiles:
-          - profile: pcp_appstore
+          - profile: pcp_distribution
       vars:
         XCODE_WORKSPACE: ios/App/App.xcworkspace
         XCODE_SCHEME: App

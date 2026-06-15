@@ -45,7 +45,18 @@ Dans Codemagic :
 
 ### Option B — upload manuel
 
-Uploader certificat `.p12` + profil `.mobileprovision` App Store avec les mêmes reference names que Codemagic attend pour `distribution_type: app_store` + `bundle_identifier: com.pcpinnov.patient`.
+Deux onglets **distincts** dans Codemagic → **Settings** → **Code signing identities** :
+
+| Onglet | Fichier | Reference name (exact) |
+|--------|---------|------------------------|
+| **iOS certificates** | `.p12` Distribution | `pcp_distribution` |
+| **iOS provisioning profiles** | `.mobileprovision` App Store | `pcp_distribution` (ou tout nom unique — doit matcher le YAML) |
+
+Le certificat et le profil sont des entrées séparées. Un certificat uploadé seul ne suffit pas.
+
+Sur Apple Developer → **Profiles** → **+** → **App Store Connect** → app `com.pcpinnov.patient` → certificat **identique** à `pcp_distribution` → cocher **HealthKit** → télécharger le `.mobileprovision`.
+
+Après upload du profil, la colonne **Certificate** doit afficher une coche verte (profil lié au bon certificat).
 
 ---
 
@@ -121,6 +132,8 @@ Rebuild iOS requis si : plugins Capacitor, Swift natif, permissions, `Info.plist
 
 | Erreur | Piste |
 |--------|-------|
+| `No provisioning profile with reference '…'` | Le **Reference name** du profil doit être identique à `profile:` dans `codemagic.yaml` |
+| `Certificate: Not uploaded` (rouge) | Le `.p12` dans **iOS certificates** n’est pas celui utilisé pour créer le profil sur Apple — aligner ou regénérer |
 | `No matching provisioning profiles` | Profil App Store + HealthKit pour `com.pcpinnov.patient` |
 | `Xcode 26` / SDK | `xcode: latest` sur `mac_mini_m2` — vérifier la stack Codemagic |
 | `pod install` fail | `pod install` local une fois pour commit `Podfile.lock` si absent |
