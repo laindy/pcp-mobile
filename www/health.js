@@ -771,7 +771,7 @@ function normalizeWorkout(w) {
   ).slice(0, 255);
   return {
     workoutType,
-    duration: toNumberOrNull(w?.duration),
+    duration: toIntOrNull(w?.duration),
     totalEnergyBurned: toNumberOrNull(w?.totalEnergyBurned),
     totalDistance: toNumberOrNull(w?.totalDistance),
     startDate,
@@ -898,6 +898,11 @@ function dedupeArray(values) {
 function toNumberOrNull(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
+}
+
+function toIntOrNull(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.round(num) : null;
 }
 
 async function handleLogin() {

@@ -394,6 +394,36 @@ public class SessionInterceptor extends BridgeWebViewClient {
             + "}"
             + "})();";
 
+    /** Safe-area pour séances wellness plein écran (respiration / méditation). */
+    private static final String WELLNESS_SAFE_AREA_JS =
+        "(function(){"
+            + "if(window.__pcpWellnessSafeArea)return;"
+            + "window.__pcpWellnessSafeArea=true;"
+            + "if(!window.__pcpSetSafeAreaInsets){"
+            + "window.__pcpSetSafeAreaInsets=function(t,b){"
+            + "document.documentElement.style.setProperty('--pcp-safe-top',Math.max(0,Number(t)||0)+'px');"
+            + "document.documentElement.style.setProperty('--pcp-safe-bottom',Math.max(0,Number(b)||0)+'px');"
+            + "};}"
+            + "if(!document.getElementById('pcp-wellness-safe-area')){"
+            + "var s=document.createElement('style');"
+            + "s.id='pcp-wellness-safe-area';"
+            + "s.textContent="
+            + "'html.pcp-mobile-app div.fixed.inset-0.z-50.bg-white{box-sizing:border-box!important}'"
+            + "+'html.pcp-mobile-app div.fixed.inset-0.z-50.bg-white>div.min-h-full.p-5,'"
+            + "+'html.pcp-mobile-app div.fixed.inset-0.z-50.bg-white>div.min-h-full.flex.flex-col.p-5{'"
+            + "+'padding-top:calc(1.25rem + var(--pcp-safe-top,env(safe-area-inset-top,0px)))!important;'"
+            + "+'padding-bottom:calc(1.25rem + var(--pcp-safe-bottom,env(safe-area-inset-bottom,0px)))!important;'"
+            + "+'box-sizing:border-box!important;min-height:100%!important}'"
+            + "+'html.pcp-mobile-app div.fixed.inset-0.z-50.bg-white div.min-h-full.relative>.top-5.left-5{'"
+            + "+'top:calc(1.25rem + var(--pcp-safe-top,env(safe-area-inset-top,0px)))!important}'"
+            + "+'html.pcp-mobile-app div.fixed.inset-0.z-50.bg-white div.min-h-full.relative>.top-6.right-5{'"
+            + "+'top:calc(1.5rem + var(--pcp-safe-top,env(safe-area-inset-top,0px)))!important}'"
+            + "+'html.pcp-mobile-app div.fixed.inset-0.z-50.bg-white div.min-h-full.relative .pb-12{'"
+            + "+'padding-bottom:calc(3rem + var(--pcp-safe-bottom,env(safe-area-inset-bottom,0px)))!important}';"
+            + "(document.head||document.documentElement).appendChild(s);"
+            + "}"
+            + "})();";
+
     private static final String HEALTH_SYNC_CONSTANTS_ASSET = "public/health-sync-constants.js";
     private static final String HEALTH_LOG_EXPORT_ASSET = "public/health-log-export.js";
     private static final String HEALTH_SERVER_BACKFILL_PROBE_ASSET = "public/health-server-backfill-probe.js";
@@ -444,8 +474,10 @@ public class SessionInterceptor extends BridgeWebViewClient {
             return;
         }
         try {
+            PcpOfflinePage.injectSafeAreaInsets(view);
             view.evaluateJavascript(INJECT_JS, null);
             view.evaluateJavascript(MOBILE_TYPO_FIX_JS, null);
+            view.evaluateJavascript(WELLNESS_SAFE_AREA_JS, null);
             view.evaluateJavascript(DOWNLOAD_INJECT_JS, null);
             view.evaluateJavascript(FILE_UPLOAD_INJECT_JS, null);
             injectAssetScript(view, HEALTH_SYNC_CONSTANTS_ASSET);

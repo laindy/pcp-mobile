@@ -55,7 +55,7 @@ enum PcpHealthKitWorkouts {
                 return [
                     "workoutType": workoutTypeName(workout.workoutActivityType),
                     "activityType": workoutTypeName(workout.workoutActivityType),
-                    "duration": workout.duration,
+                    "duration": Int(workout.duration.rounded()),
                     "totalEnergyBurned": energy as Any,
                     "totalDistance": distance as Any,
                     "startDate": formatter.string(from: workout.startDate),

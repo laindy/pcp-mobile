@@ -2279,6 +2279,12 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  /** Durée workout (secondes) — l'API attend un entier (HealthKit renvoie des float). */
+  function toIntOrNull(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.round(n) : null;
+  }
+
   function defaultUnit(type) {
     const map = {
       steps: "count",
@@ -2408,7 +2414,7 @@
     );
     return {
       workoutType,
-      duration: toNum(w?.duration),
+      duration: toIntOrNull(w?.duration),
       totalEnergyBurned: toNum(w?.totalEnergyBurned),
       totalDistance: toNum(w?.totalDistance),
       startDate,
