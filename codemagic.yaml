@@ -1,0 +1,153 @@
+# PCPTherapy mobile — Codemagic CI/CD
+# Guide pas-à-pas : docs/codemagic-setup.md
+#
+# Prérequis Codemagic UI (une fois) :
+#   1. Team integrations → App Store Connect API key (nom = PCP_AppStoreConnect)
+#   2. Code signing → certificat Distribution + profil App Store (com.pcpinnov.patient + HealthKit)
+#   3. App Store Connect → app créée, noter l'Apple ID numérique → APP_STORE_APPLE_ID ci-dessous
+
+workflows:
+  ios-testflight:
+    name: iOS → TestFlight
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+
+    integrations:
+      # Doit correspondre EXACTEMENT au nom de la clé API dans Codemagic UI
+      app_store_connect: PCP_AppStoreConnect
+
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.pcpinnov.patient
+      vars:
+        XCODE_WORKSPACE: ios/App/App.xcworkspace
+        XCODE_SCHEME: App
+        # App Store Connect → Apps → PCPTherapy → General → App Information → Apple ID
+        APP_STORE_APPLE_ID: 0
+      node: 22
+      xcode: latest
+      cocoapods: default
+
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+        - pattern: feat/*
+          include: true
+      tag_patterns:
+        - pattern: v*
+          include: true
+
+    scripts:
+      - name: Install npm dependencies
+        script: npm ci
+
+      - name: Sync Capacitor iOS
+        script: npx cap sync ios
+
+      - name: Install CocoaPods
+        script: |
+          cd ios/App
+          pod install
+
+      - name: Export compliance (HTTPS only, no custom encryption)
+        script: |
+          PLIST="$CM_BUILD_DIR/ios/App/App/Info.plist"
+          if ! /usr/libexec/PlistBuddy -c "Print :ITSAppUsesNonExemptEncryption" "$PLIST" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST"
+          fi
+
+      - name: Set up code signing
+        script: xcode-project use-profiles
+
+      - name: Increment build number
+        script: |
+          cd "$CM_BUILD_DIR/ios/App"
+          if [ -n "$APP_STORE_APPLE_ID" ] && [ "$APP_STORE_APPLE_ID" != "0" ]; then
+            LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" 2>/dev/null || echo "")
+            if [ -z "$LATEST" ]; then
+              LATEST=$(app-store-connect get-latest-app-store-build-number "$APP_STORE_APPLE_ID" 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -z "$LATEST" ]; then
+            UPDATED=$BUILD_NUMBER
+          else
+            UPDATED=$((LATEST + 1))
+          fi
+          agvtool new-version -all "$UPDATED"
+          echo "Build number → $UPDATED"
+
+      - name: Build ipa
+        script: |
+          xcode-project build-ipa \
+            --workspace "$CM_BUILD_DIR/$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      email:
+        recipients:
+          - $CM_BUILD_AUTHOR_EMAIL
+        notify:
+          success: true
+          failure: true
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+        # Remplacer par le nom exact du groupe TestFlight dans App Store Connect
+        beta_groups:
+          - Internal Testers
+
+  ios-build-only:
+    name: iOS build (sans upload)
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+
+    integrations:
+      app_store_connect: PCP_AppStoreConnect
+
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.pcpinnov.patient
+      vars:
+        XCODE_WORKSPACE: ios/App/App.xcworkspace
+        XCODE_SCHEME: App
+      node: 22
+      xcode: latest
+      cocoapods: default
+
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: pull_request
+
+    scripts:
+      - name: Install npm dependencies
+        script: npm ci
+      - name: Sync Capacitor iOS
+        script: npx cap sync ios
+      - name: Install CocoaPods
+        script: |
+          cd ios/App
+          pod install
+      - name: Set up code signing
+        script: xcode-project use-profiles
+      - name: Build ipa
+        script: |
+          xcode-project build-ipa \
+            --workspace "$CM_BUILD_DIR/$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
