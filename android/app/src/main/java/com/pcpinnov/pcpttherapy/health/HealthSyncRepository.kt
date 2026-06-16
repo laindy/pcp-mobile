@@ -765,6 +765,13 @@ class HealthSyncRepository(private val context: Context) {
         start: Instant,
         end: Instant,
     ): Map<String, List<SamplePoint>> {
+        val sleepRaw = readSampleType(ctx, "sleep", start, end)
+        val nightIndex = HistoricalLightCompactor.buildWakeDayNightTimestampIndex(
+            sleepRaw,
+            ctx.dailyByDay,
+            zone,
+            historicalLight = false,
+        )
         val out = linkedMapOf<String, List<SamplePoint>>()
         val types = listOf(
             "heartRateVariability",
@@ -775,7 +782,7 @@ class HealthSyncRepository(private val context: Context) {
         for (type in types) {
             val raw = readSampleType(ctx, type, start, end)
             if (raw.isEmpty()) continue
-            val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(raw, type, zone)
+            val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(raw, type, zone, nightIndex)
             if (collapsed.isEmpty()) continue
             Log.i(tag, "Vitaux daily-extended $type: ${raw.size} bruts → ${collapsed.size} jour(s)")
             out[type] = collapsed

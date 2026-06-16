@@ -164,7 +164,7 @@
         const intradayDays =
           global.PcpHealthSyncConstants?.SAMPLE_INTRADAY_LOOKBACK_DAYS ?? 90;
         const recoveryRepairKey =
-          storage?.RECOVERY_RESCORE_REPAIR_KEY || "pcpHealthRecoveryRescoreRepairV1";
+          storage?.RECOVERY_RESCORE_REPAIR_KEY || "pcpHealthRecoveryRescoreRepairV2";
         const recoveryRepairAt = storage?.getItem
           ? storage.getItem(recoveryRepairKey)
           : sessionStorage.getItem(pid ? `${recoveryRepairKey}:${pid}` : recoveryRepairKey);

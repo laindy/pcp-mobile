@@ -360,11 +360,11 @@ class TokenStore(private val context: Context) {
             val sampleStart = nowMs - SAMPLE_INTRADAY_LOOKBACK_MS
             val recentStart = nowMs - PRIORITY_LOOKBACK_MS
             val phases = mutableListOf<SyncPhase>()
-            if (dailyStart < sampleStart) {
-                phases += SyncPhase(dailyStart, sampleStart, "daily-extended")
-            }
             if (sampleStart < recentStart) {
                 phases += SyncPhase(sampleStart, recentStart, "historical")
+            }
+            if (dailyStart < sampleStart) {
+                phases += SyncPhase(dailyStart, sampleStart, "daily-extended")
             }
             if (phases.isNotEmpty()) {
                 Log.i(tag, "Backfill historique interrompu — reprise par tranches")
@@ -379,11 +379,11 @@ class TokenStore(private val context: Context) {
         val phases = mutableListOf(
             SyncPhase(recentStart, nowMs, if (lastDataSync > 0L) "catch-up" else "priority"),
         )
-        if (dailyStart < sampleStart) {
-            phases += SyncPhase(dailyStart, sampleStart, "daily-extended")
-        }
         if (sampleStart < recentStart) {
             phases += SyncPhase(sampleStart, recentStart, "historical")
+        }
+        if (dailyStart < sampleStart) {
+            phases += SyncPhase(dailyStart, sampleStart, "daily-extended")
         }
         return phases
     }

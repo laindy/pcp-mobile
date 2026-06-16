@@ -5,18 +5,23 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
-import org.json.JSONObject
 import java.time.Instant
 import java.time.ZoneId
 import java.util.UUID
 
 /**
- * Réparation 1× recovery j 8–90 : re-envoie HRV compact (1/jour) pour forcer le
- * rescoring backend sur les jours déjà syncés avant inversion daily-extended → historical.
+ * Réparation 1× j 8–90 : re-envoie vitaux compacts (horaire nocturne) pour rescoring
+ * backend sur les comptes déjà syncés avec timestamps midi.
  */
 object RecoveryRescoreExecutor {
 
     private const val TAG = "RecoveryRescoreRepair"
+
+    private val REPAIR_TYPES = listOf(
+        "heartRateVariability",
+        "respiratoryRate",
+        "oxygenSaturation",
+    )
 
     suspend fun maybeRun(
         context: Context,
@@ -41,35 +46,48 @@ object RecoveryRescoreExecutor {
         val endInst = Instant.ofEpochMilli(end)
         val zone = ZoneId.systemDefault()
 
-        val raw = repository.readSampleType(ctx, "heartRateVariability", startInst, endInst)
-        if (raw.isEmpty()) {
-            Log.i(TAG, "RECOVERY_RESCORE_REPAIR skip — aucun HRV HC j 8–90")
-            return@withContext false
+        val sleepRaw = repository.readSampleType(ctx, "sleep", startInst, endInst)
+        val nightIndex = HistoricalLightCompactor.buildWakeDayNightTimestampIndex(
+            sleepRaw,
+            ctx.dailyByDay,
+            zone,
+            historicalLight = true,
+        )
+
+        val merged = linkedMapOf<String, List<SamplePoint>>()
+        var totalSamples = 0
+        for (type in REPAIR_TYPES) {
+            val raw = repository.readSampleType(ctx, type, startInst, endInst)
+            if (raw.isEmpty()) continue
+            val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(
+                raw,
+                type,
+                zone,
+                nightIndex,
+            )
+            if (collapsed.isEmpty()) continue
+            merged[type] = collapsed
+            totalSamples += collapsed.size
         }
 
-        val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(
-            raw,
-            "heartRateVariability",
-            zone,
-        )
-        if (collapsed.isEmpty()) {
-            Log.i(TAG, "RECOVERY_RESCORE_REPAIR skip — HRV compact vide")
+        if (merged.isEmpty()) {
+            Log.i(TAG, "RECOVERY_RESCORE_REPAIR skip — aucun vital compact j 8–90")
             return@withContext false
         }
 
         Log.i(
             TAG,
-            "RECOVERY_RESCORE_REPAIR début — HRV ${raw.size} bruts → ${collapsed.size} jour(s)",
+            "RECOVERY_RESCORE_REPAIR début — ${merged.size} type(s), $totalSamples sample(s)",
         )
         HealthBridge.logToJs(
-            "[sync-session] RECOVERY_RESCORE_REPAIR début samples=${collapsed.size}",
+            "[sync-session] RECOVERY_RESCORE_REPAIR début samples=$totalSamples",
         )
 
         val payload = repository.buildPartialPayload(
             ctx,
             startInst,
             endInst,
-            mapOf("heartRateVariability" to collapsed),
+            merged,
             emptyList(),
             emptyList(),
         )
@@ -79,15 +97,15 @@ object RecoveryRescoreExecutor {
             phaseLabel = "recovery-rescore-repair",
             includeDailyAggregates = false,
         )
-        body.optJSONObject("fetch")?.put("strategy", "health_connect_recovery_rescore_repair")
+        body.optJSONObject("fetch")?.put("strategy", "healthkit_recovery_rescore_repair")
 
-        return@withContext when (val post = HealthSyncExecutor.postSyncPublic(store, http, body)) {
+        when (val post = HealthSyncExecutor.postSyncPublic(store, http, body)) {
             is HealthSyncExecutor.PostResult.Success -> {
-                store.setRecoveryRescoreRepairAt(patientId, System.currentTimeMillis())
-                val msg =
-                    "RECOVERY_RESCORE_REPAIR ok — ${collapsed.size} jour(s), ins=${post.samplesInserted}"
-                Log.i(TAG, msg)
-                HealthBridge.logToJs("[sync-session] $msg")
+                store.setRecoveryRescoreRepairAt(patientId, now)
+                Log.i(TAG, "RECOVERY_RESCORE_REPAIR ok samples=$totalSamples")
+                HealthBridge.logToJs(
+                    "[sync-session] RECOVERY_RESCORE_REPAIR ok samples=$totalSamples",
+                )
                 true
             }
             else -> {

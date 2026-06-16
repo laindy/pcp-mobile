@@ -84,8 +84,8 @@
   const DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY = "pcpHealthDailyExtendedSleepWorkoutRepairV2";
   /** Réparation 1× intraday scoring j 61–90 (migration 60 → 90 j). */
   const SCORING_90D_REPAIR_KEY = "pcpHealthScoring90dRepairV1";
-  /** Réparation 1× recovery j 8–90 : re-envoi HRV pour forcer le rescoring backend. */
-  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV1";
+  /** Réparation 1× recovery j 8–90 : re-envoi vitaux nocturnes pour rescoring backend. */
+  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV2";
   /** Dernier patient dont l'état sync (backfill / incrémental) a été lu. */
   const SYNC_SCOPE_PATIENT_KEY = "pcpHealthSyncScopePatientId";
   const SYNC_STUCK_RESET_MS = 12 * 60 * 1000;
@@ -2954,16 +2954,16 @@
   }
 
   /**
-   * Backfill arrière-plan : daily-extended (j 91–365) avant historical (j 8–90).
-   * Le backend ne recalcule que les jours du lot courant ; sans HRV plus ancien en
-   * base, recovery_score reste null sur la fenêtre intraday.
+   * Backfill arrière-plan : historical (j 8–90) puis daily-extended (j 91–365).
+   * Le recovery sur j 8–90 est corrigé en fin de backfill via maybeRepairRecoveryRescore
+   * (re-post vitaux nuit + rescoring backend), pas via l'ordre des phases.
    */
   function appendBackfillPhases(phases, dailyStart, sampleStart, recentStart) {
-    if (dailyStart.getTime() < sampleStart.getTime()) {
-      phases.push({ startDate: dailyStart, endDate: sampleStart, label: "daily-extended" });
-    }
     if (sampleStart.getTime() < recentStart.getTime()) {
       phases.push({ startDate: sampleStart, endDate: recentStart, label: "historical" });
+    }
+    if (dailyStart.getTime() < sampleStart.getTime()) {
+      phases.push({ startDate: dailyStart, endDate: sampleStart, label: "daily-extended" });
     }
   }
 
@@ -3020,10 +3020,88 @@
     };
   }
 
-  /** Midi local — 1 sample/jour pour alimenter le scoring backend (lit HealthSample, pas les agrégats). */
+  /** Midi local — pas/calories (totaux journaliers, pas de scoring nocturne). */
   function dailyNoonIso(dayKey) {
     const d = new Date(`${dayKey}T12:00:00`);
     return Number.isNaN(d.getTime()) ? `${dayKey}T12:00:00.000Z` : d.toISOString();
+  }
+
+  /** 04:00 UTC — repli backend _NIGHT_FALLBACK (00:00–10:00 UTC → jour de réveil). */
+  function dailyWakeFallbackIso(dayKey) {
+    return `${dayKey}T04:00:00.000Z`;
+  }
+
+  function addDayKey(dayKey, deltaDays) {
+    const d = new Date(`${dayKey}T12:00:00Z`);
+    if (Number.isNaN(d.getTime())) return dayKey;
+    d.setUTCDate(d.getUTCDate() + deltaDays);
+    return d.toISOString().slice(0, 10);
+  }
+
+  /** Jour de réveil (UTC) — aligné sur health_service._night_values_by_day. */
+  function vitalWakeDayFromIso(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return localDayKey(iso);
+    const h = d.getUTCHours();
+    const day = localDayKey(iso);
+    if (h >= 20) return addDayKey(day, 1);
+    if (h < 10) return day;
+    return day;
+  }
+
+  function isNonSleepStageForVitalIndex(stageName) {
+    const n = normalizeSleepToken(stageName ?? "");
+    if (!n) return false;
+    if (isInBedStageName(n) || n.includes("awake")) return true;
+    return false;
+  }
+
+  /** wakeDay → ISO au milieu du plus long segment sommeil (pour attribution nocturne backend). */
+  function buildWakeDayNightTimestampIndex(sleepSamples) {
+    const best = new Map();
+    for (const s of sleepSamples ?? []) {
+      const stage = s?.extra?.stage ?? s?.stage ?? null;
+      if (isNonSleepStageForVitalIndex(stage)) continue;
+      const startMs = new Date(s.startDate).getTime();
+      const endMs = new Date(s.endDate ?? s.startDate).getTime();
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
+      const wakeDay = localDayKey(new Date(endMs).toISOString());
+      const dur = endMs - startMs;
+      const prev = best.get(wakeDay);
+      if (!prev || dur > prev.dur) {
+        best.set(wakeDay, { dur, iso: new Date(startMs + dur / 2).toISOString() });
+      }
+    }
+    const out = {};
+    for (const [k, v] of best) out[k] = v.iso;
+    return out;
+  }
+
+  function resolveVitalNightIso(wakeDay, nightIndex) {
+    if (nightIndex?.[wakeDay]) return nightIndex[wakeDay];
+    return dailyWakeFallbackIso(wakeDay);
+  }
+
+  async function loadVitalNightIndex(Health, startIso, endIsoQuery, historicalLight, sleepLight) {
+    try {
+      const sleepRead = await readAllSleepSamples(Health, startIso, endIsoQuery, {
+        light: !!sleepLight,
+      });
+      let sleepSamples = [];
+      if (historicalLight) {
+        sleepSamples = buildSleepCompactStagedSamplesFromRaw(sleepRead.raw ?? []);
+        if (!sleepSamples.length && sleepRead.dailyRows?.length) {
+          sleepSamples = buildSleepSyntheticFromDailyRows(sleepRead.dailyRows);
+        }
+      } else if (sleepRead.dailyRows?.length) {
+        sleepSamples = buildSleepSyntheticFromDailyRows(sleepRead.dailyRows);
+      } else if (sleepRead.normalized?.length) {
+        sleepSamples = sleepRead.normalized;
+      }
+      return buildWakeDayNightTimestampIndex(sleepSamples);
+    } catch (_) {
+      return {};
+    }
   }
 
   const HISTORICAL_LIGHT_PHASES = new Set(["historical", "bg-historical"]);
@@ -3068,27 +3146,27 @@
    * Compresse des samples bruts en 1 point/jour (médiane HRV, moyenne resp/SpO₂/temp).
    * Aligné sur health_service._load_score_inputs (médiane log-HRV par jour).
    */
-  function collapseVitalSamplesToDailySynthetic(samples, dataType) {
-    const byDay = new Map();
+  function collapseVitalSamplesToDailySynthetic(samples, dataType, nightIndex) {
+    const byWake = new Map();
     for (const s of samples ?? []) {
-      const day = localDayKey(s.startDate);
-      if (!day || s.value == null) continue;
-      if (!byDay.has(day)) byDay.set(day, []);
-      byDay.get(day).push(s.value);
+      const wakeDay = vitalWakeDayFromIso(s.startDate);
+      if (!wakeDay || s.value == null) continue;
+      if (!byWake.has(wakeDay)) byWake.set(wakeDay, []);
+      byWake.get(wakeDay).push(s.value);
     }
     const out = [];
-    for (const [day, vals] of byDay) {
+    for (const [wakeDay, vals] of byWake) {
       const val =
         dataType === "heartRateVariability" ? medianOf(vals) : averageOf(vals);
       if (val == null || !Number.isFinite(val) || val <= 0) continue;
-      const startDate = dailyNoonIso(day);
+      const startDate = resolveVitalNightIso(wakeDay, nightIndex);
       const norm = normalizeSample(dataType, {
         dataType,
         value: val,
         unit: defaultUnit(dataType),
         startDate,
         endDate: startDate,
-        platformId: `${dataType}|agg|${day}`,
+        platformId: `${dataType}|agg|${wakeDay}`,
         sourceName: "healthkit",
       });
       if (norm) out.push(norm);
@@ -3111,6 +3189,7 @@
     grantedSet,
     readGranted,
     errors,
+    nightIndex,
   ) {
     const out = {};
     for (const type of DAILY_EXTENDED_VITAL_TYPES) {
@@ -3119,7 +3198,7 @@
         if (!readGranted.includes(type)) readGranted.push(type);
         const chunkRead = await readAllSamplesByDateChunks(Health, type, startIso, endIsoQuery);
         const rawSamples = chunkRead.samples ?? [];
-        let samples = collapseVitalSamplesToDailySynthetic(rawSamples, type);
+        let samples = collapseVitalSamplesToDailySynthetic(rawSamples, type, nightIndex);
         log(`  daily-extended ${type}: ${rawSamples.length} bruts → ${samples.length} jour(s)`);
         if (samples.length === 0 && rawSamples.length > 0) {
           log(`  daily-extended ${type}: repli samples bruts (${rawSamples.length})`);
@@ -3260,7 +3339,7 @@
    * queryAggregated fournit pas/calories/FC repos ; le backend rollup lit HealthSample.
    * Sans sample steps, un lot vitaux/sommeil seul peut effacer steps_total en base.
    */
-  function buildScoringSamplesFromDailyAggregates(dailyList) {
+  function buildScoringSamplesFromDailyAggregates(dailyList, nightIndex) {
     const specs = [
       { type: "steps", field: "steps_total", intValue: true },
       { type: "calories", field: "calories_total_kcal" },
@@ -3274,7 +3353,10 @@
         const val = toNum(row[spec.field]);
         if (val == null || val <= 0) continue;
         const sampleVal = spec.intValue ? Math.round(val) : val;
-        const startDate = dailyNoonIso(row.day);
+        const startDate =
+          spec.type === "restingHeartRate"
+            ? resolveVitalNightIso(row.day, nightIndex)
+            : dailyNoonIso(row.day);
         const norm = normalizeSample(spec.type, {
           dataType: spec.type,
           value: sampleVal,
@@ -3298,8 +3380,8 @@
     return out;
   }
 
-  function mergeScoringSamplesFromDailyAggregates(samplesByType, dailyList) {
-    const blocks = buildScoringSamplesFromDailyAggregates(dailyList);
+  function mergeScoringSamplesFromDailyAggregates(samplesByType, dailyList, nightIndex) {
+    const blocks = buildScoringSamplesFromDailyAggregates(dailyList, nightIndex);
     for (const [type, block] of Object.entries(blocks)) {
       if (samplesByType[type]?.samples?.length > 0) continue;
       samplesByType[type] = block;
@@ -3417,6 +3499,29 @@
       );
     }
 
+    const needsVitalNightIndex =
+      vitalCompact ||
+      isDailyExtendedPhase(phaseLabel) ||
+      (Array.isArray(onlyTypes) &&
+        onlyTypes.some((t) =>
+          [
+            "heartRateVariability",
+            "respiratoryRate",
+            "oxygenSaturation",
+            "restingHeartRate",
+          ].includes(t),
+        ));
+    let vitalNightIndex = {};
+    if (needsVitalNightIndex && grantedSet.has("sleep")) {
+      vitalNightIndex = await loadVitalNightIndex(
+        Health,
+        startIso,
+        endIsoQuery,
+        historicalLight,
+        sleepCompact || historicalLight,
+      );
+    }
+
     const baseShell = buildSyncBasePayload({
       syncId,
       startIso,
@@ -3508,7 +3613,7 @@
 
     if (dailyExtendedOnly) {
       if (hasQueryAggregated) {
-        const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw);
+        const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw, vitalNightIndex);
         for (const type of ["steps", "calories", "restingHeartRate"]) {
           const block = scoringBlocks[type];
           if (!block?.samples?.length) continue;
@@ -3618,6 +3723,7 @@
           grantedSet,
           readGranted,
           errors,
+          vitalNightIndex,
         );
         for (const [type, samples] of Object.entries(vitalBlocks)) {
           totalSamples += samples.length;
@@ -3732,7 +3838,7 @@
     }
 
     if (hasQueryAggregated && !onlyTypes) {
-      const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw);
+      const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw, vitalNightIndex);
       const scoringOrder = ["steps", "calories", "restingHeartRate"];
       for (const type of scoringOrder) {
         const block = scoringBlocks[type];
@@ -3825,7 +3931,7 @@
           const chunkRead = await readAllSamplesByDateChunks(Health, type, startIso, endIsoQuery);
           const rawSamples = chunkRead.samples ?? [];
           typeTruncated = !!chunkRead.truncated;
-          samples = collapseVitalSamplesToDailySynthetic(rawSamples, type);
+          samples = collapseVitalSamplesToDailySynthetic(rawSamples, type, vitalNightIndex);
           const compactLabel = historicalLight ? "léger" : "compact";
           log(`  ${type} ${compactLabel}: ${rawSamples.length} bruts → ${samples.length} jour(s)`);
           if (samples.length === 0 && rawSamples.length > 0) {
@@ -4009,7 +4115,7 @@
     if (tempSamples.length > 0) {
       let tempToPost = tempSamples;
       if (historicalLight && tempSamples.length > 50) {
-        const collapsed = collapseVitalSamplesToDailySynthetic(tempSamples, "bodyTemperature");
+        const collapsed = collapseVitalSamplesToDailySynthetic(tempSamples, "bodyTemperature", vitalNightIndex);
         if (collapsed.length > 0) {
           log(`  bodyTemperature léger: ${tempSamples.length} bruts → ${collapsed.length} jour(s)`);
           tempToPost = collapsed;
@@ -4312,7 +4418,7 @@
       grantedSet,
     );
     if (hasQueryAggregated) {
-      const scoringBlocks = mergeScoringSamplesFromDailyAggregates(samplesByType, dailyAggsFilled);
+      const scoringBlocks = mergeScoringSamplesFromDailyAggregates(samplesByType, dailyAggsFilled, vitalNightIndex);
       for (const block of Object.values(scoringBlocks)) {
         totalSamples += block.samples?.length ?? 0;
       }
@@ -4376,7 +4482,7 @@
       );
     }
     if (hasQueryAggregated) {
-      mergeScoringSamplesFromDailyAggregates(samplesByType, dailyAggregates);
+      mergeScoringSamplesFromDailyAggregates(samplesByType, dailyAggregates, vitalNightIndex);
     }
 
     return {
@@ -5260,8 +5366,8 @@
   }
 
   /**
-   * Réparation 1× j 8–90 : re-envoie HRV compact pour forcer le rescoring recovery
-   * côté backend (comptes backfillés avant inversion daily-extended → historical).
+   * Réparation 1× j 8–90 : re-envoie vitaux nuit (HRV, resp, SpO₂, FC repos) pour
+   * forcer le rescoring recovery côté backend une fois daily-extended terminé.
    */
   async function maybeRepairRecoveryRescore(Health, token, options) {
     if (options?.skipRecoveryRescoreRepair || options?.fullLookback) {
@@ -5291,7 +5397,12 @@
     const result = await collectAndStreamPost(Health, startDate, endDate, token, {
       manual: !!options?.manual,
       phase: "historical",
-      onlyTypes: ["heartRateVariability"],
+      onlyTypes: [
+        "heartRateVariability",
+        "respiratoryRate",
+        "oxygenSaturation",
+        "restingHeartRate",
+      ],
       repairStrategy: "healthkit_recovery_rescore_repair",
     });
 

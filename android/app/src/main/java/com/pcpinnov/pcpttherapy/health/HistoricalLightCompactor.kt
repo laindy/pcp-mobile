@@ -4,6 +4,7 @@ import android.util.Log
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
+import java.time.ZoneOffset
 import kotlin.math.round
 
 /**
@@ -28,7 +29,7 @@ object HistoricalLightCompactor {
     fun isIncrementalCompact(phaseLabel: String): Boolean =
         phaseLabel in INCREMENTAL_COMPACT
 
-    /** Vitals bruts sur sync incrémentale / récente — compaction uniquement historique 8–60j. */
+    /** Vitaux bruts sur sync incrémentale / récente — compaction uniquement historique 8–60j. */
     fun useVitalCompact(phaseLabel: String): Boolean =
         isHistoricalLight(phaseLabel)
 
@@ -46,10 +47,13 @@ object HistoricalLightCompactor {
         val label = if (isHistoricalLight(phaseLabel)) "léger" else "compact"
         Log.i(TAG, "Phase $phaseLabel — mode $label")
 
+        val sleepRaw = samplesByType["sleep"] ?: emptyList()
+        val nightIndex = buildWakeDayNightTimestampIndex(sleepRaw, dailyByDay, zone, isHistoricalLight(phaseLabel))
+
         for (type in VITAL_COMPACT_TYPES) {
             val raw = samplesByType[type] ?: continue
             if (raw.isEmpty()) continue
-            val collapsed = collapseVitalsToDaily(raw, type, zone, useMedian = type == "heartRateVariability")
+            val collapsed = collapseVitalsToDaily(raw, type, zone, useMedian = type == "heartRateVariability", nightIndex)
             if (collapsed.isNotEmpty()) {
                 Log.i(TAG, "  $type $label: ${raw.size} bruts → ${collapsed.size} jour(s)")
                 samplesByType[type] = collapsed.toMutableList()
@@ -60,7 +64,7 @@ object HistoricalLightCompactor {
         if (!temps.isNullOrEmpty()) {
             val shouldCollapse = isHistoricalLight(phaseLabel) && temps.size > 50
             if (shouldCollapse) {
-                val collapsed = collapseVitalsToDaily(temps, "bodyTemperature", zone, useMedian = false)
+                val collapsed = collapseVitalsToDaily(temps, "bodyTemperature", zone, useMedian = false, nightIndex)
                 if (collapsed.isNotEmpty()) {
                     Log.i(TAG, "  bodyTemperature $label: ${temps.size} bruts → ${collapsed.size} jour(s)")
                     samplesByType["bodyTemperature"] = collapsed.toMutableList()
@@ -68,7 +72,6 @@ object HistoricalLightCompactor {
             }
         }
 
-        val sleepRaw = samplesByType["sleep"] ?: return
         if (sleepRaw.isEmpty()) return
 
         val compacted = if (isHistoricalLight(phaseLabel)) {
@@ -94,11 +97,13 @@ object HistoricalLightCompactor {
         samples: List<SamplePoint>,
         dataType: String,
         zone: ZoneId,
+        nightIndex: Map<LocalDate, Instant> = emptyMap(),
     ): List<SamplePoint> = collapseVitalsToDaily(
         samples,
         dataType,
         zone,
         useMedian = dataType == "heartRateVariability",
+        nightIndex,
     )
 
     private fun collapseVitalsToDaily(
@@ -106,29 +111,76 @@ object HistoricalLightCompactor {
         dataType: String,
         zone: ZoneId,
         useMedian: Boolean,
+        nightIndex: Map<LocalDate, Instant>,
     ): List<SamplePoint> {
-        val byDay = samples.groupBy { instantToLocalDate(it.startAt, zone) }
+        val byWake = samples.groupBy { vitalWakeDay(it.startAt, zone) }
         val out = mutableListOf<SamplePoint>()
-        for ((day, list) in byDay) {
+        for ((wakeDay, list) in byWake) {
             val vals = list.map { it.value }.filter { it.isFinite() && it > 0 }
             if (vals.isEmpty()) continue
             val value = if (useMedian) median(vals) else average(vals) ?: continue
             if (value <= 0) continue
-            val noon = day.atTime(12, 0).atZone(zone).toInstant()
+            val instant = nightIndex[wakeDay] ?: dailyWakeFallbackInstant(wakeDay)
             val rounded = round(value * 100.0) / 100.0
             out += SamplePoint(
                 dataType = dataType,
                 value = rounded,
                 unit = list.first().unit,
-                startAt = noon,
-                endAt = noon,
+                startAt = instant,
+                endAt = instant,
                 sourceId = "health_connect",
                 sourceName = "health_connect",
-                platformId = "${dataType}|agg|$day|$rounded".take(255),
+                platformId = "${dataType}|agg|$wakeDay|$rounded".take(255),
                 origin = list.firstOrNull { it.origin != null }?.origin,
             )
         }
         return out
+    }
+
+    private fun vitalWakeDay(instant: Instant, zone: ZoneId): LocalDate {
+        val zdt = instant.atZone(ZoneOffset.UTC)
+        val localDay = instant.atZone(zone).toLocalDate()
+        val h = zdt.hour
+        return when {
+            h >= 20 -> localDay.plusDays(1)
+            h < 10 -> localDay
+            else -> localDay
+        }
+    }
+
+    private fun dailyWakeFallbackInstant(wakeDay: LocalDate): Instant =
+        wakeDay.atTime(4, 0).toInstant(ZoneOffset.UTC)
+
+    private fun isNonSleepStageForVitalIndex(stage: String?): Boolean {
+        if (stage.isNullOrBlank()) return false
+        val n = stage.lowercase()
+        return n.contains("awake") || n.contains("inbed") || n.contains("in_bed")
+    }
+
+    fun buildWakeDayNightTimestampIndex(
+        sleepRaw: List<SamplePoint>,
+        dailyByDay: Map<LocalDate, DailyAggregate>,
+        zone: ZoneId,
+        historicalLight: Boolean,
+    ): Map<LocalDate, Instant> {
+        val staged = if (historicalLight) {
+            compactSleepStagedHistorical(sleepRaw, zone)
+        } else {
+            buildSleepSyntheticFromDaily(dailyByDay, zone)
+        }
+        val best = mutableMapOf<LocalDate, Pair<Long, Instant>>()
+        for (s in staged) {
+            if (isNonSleepStageForVitalIndex(s.stage)) continue
+            if (!s.endAt.isAfter(s.startAt)) continue
+            val wakeDay = instantToLocalDate(s.endAt, zone)
+            val dur = s.endAt.epochSecond - s.startAt.epochSecond
+            val mid = s.startAt.plusSeconds(dur / 2)
+            val prev = best[wakeDay]
+            if (prev == null || dur > prev.first) {
+                best[wakeDay] = dur to mid
+            }
+        }
+        return best.mapValues { it.value.second }
     }
 
     /** Historique : fusion par stade/nuit avec horaires réels (REM+Deep pour scoring). */
