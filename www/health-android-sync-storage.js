@@ -11,6 +11,7 @@
   var STEPS_REPAIR_KEY = "pcpHealthStepsRepairV2";
   var SLEEP_STAGES_REPAIR_KEY = "pcpHealthSleepStagesRepairV1";
   var SCORING_90D_REPAIR_KEY = "pcpHealthScoring90dRepairV1";
+  var RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV1";
   var SYNC_SCOPE_PATIENT_KEY = "pcpHealthSyncScopePatientId";
   var NATIVE_PERSIST_KEYS = new Set([
     FULL_BACKFILL_KEY,
@@ -20,6 +21,7 @@
     STEPS_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
+    RECOVERY_RESCORE_REPAIR_KEY,
   ]);
   var NATIVE_TS_KEYS = new Set([
     FULL_BACKFILL_KEY,
@@ -27,6 +29,7 @@
     STEPS_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
+    RECOVERY_RESCORE_REPAIR_KEY,
   ]);
 
   function log(msg) {
@@ -224,6 +227,7 @@
     STEPS_REPAIR_KEY: STEPS_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY: SLEEP_STAGES_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY: SCORING_90D_REPAIR_KEY,
+    RECOVERY_RESCORE_REPAIR_KEY: RECOVERY_RESCORE_REPAIR_KEY,
     getItem: getItem,
     setItem: setItem,
     ensureSyncPatientScope: ensureSyncPatientScope,

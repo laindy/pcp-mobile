@@ -160,6 +160,25 @@
         );
       } catch (_) {}
       try {
+        const priorityDays = global.PcpHealthSyncConstants?.PRIORITY_LOOKBACK_DAYS ?? 7;
+        const intradayDays =
+          global.PcpHealthSyncConstants?.SAMPLE_INTRADAY_LOOKBACK_DAYS ?? 90;
+        const recoveryRepairKey =
+          storage?.RECOVERY_RESCORE_REPAIR_KEY || "pcpHealthRecoveryRescoreRepairV1";
+        const recoveryRepairAt = storage?.getItem
+          ? storage.getItem(recoveryRepairKey)
+          : sessionStorage.getItem(pid ? `${recoveryRepairKey}:${pid}` : recoveryRepairKey);
+        parts.push(
+          `Réparation recovery rescoring j ${priorityDays + 1}–${intradayDays} (1×): ${
+            recoveryRepairAt
+              ? `effectuée ${new Date(parseInt(recoveryRepairAt, 10)).toISOString()}`
+              : fullAt
+                ? "en attente (prochaine sync)"
+                : "—"
+          }`,
+        );
+      } catch (_) {}
+      try {
         const planMetaRaw = sessionStorage.getItem("pcpHealthSyncPlanMeta");
         if (planMetaRaw) {
           const pm = JSON.parse(planMetaRaw);

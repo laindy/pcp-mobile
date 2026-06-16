@@ -19,6 +19,7 @@ object HealthSyncStateStore {
     const val KEY_SLEEP_DAILY_REPAIR = "pcpHealthSleepDailyRepairV2"
     const val KEY_SLEEP_STAGES_REPAIR = "pcpHealthSleepStagesRepairV1"
     const val KEY_DAILY_EXTENDED_CHECKPOINT = "pcpHealthDailyExtendedCheckpoint"
+    const val KEY_RECOVERY_RESCORE_REPAIR = "pcpHealthRecoveryRescoreRepairV1"
 
     private const val PREFS = "pcp_health_sync_state_by_patient"
     private const val KEY_PREFIX = "pcp_health_sync_state_"

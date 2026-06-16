@@ -84,6 +84,8 @@
   const DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY = "pcpHealthDailyExtendedSleepWorkoutRepairV2";
   /** Réparation 1× intraday scoring j 61–90 (migration 60 → 90 j). */
   const SCORING_90D_REPAIR_KEY = "pcpHealthScoring90dRepairV1";
+  /** Réparation 1× recovery j 8–90 : re-envoi HRV pour forcer le rescoring backend. */
+  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV1";
   /** Dernier patient dont l'état sync (backfill / incrémental) a été lu. */
   const SYNC_SCOPE_PATIENT_KEY = "pcpHealthSyncScopePatientId";
   const SYNC_STUCK_RESET_MS = 12 * 60 * 1000;
@@ -100,6 +102,7 @@
     SLEEP_STAGES_REPAIR_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
+    RECOVERY_RESCORE_REPAIR_KEY,
   ]);
   const NATIVE_TS_KEYS = new Set([
     FULL_BACKFILL_KEY,
@@ -108,6 +111,7 @@
     SLEEP_STAGES_REPAIR_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
+    RECOVERY_RESCORE_REPAIR_KEY,
   ]);
 
   function patientIdFromAccessToken(token) {
@@ -2923,12 +2927,7 @@
       const sampleStart = new Date(endDate.getTime() - daysToMs(SAMPLE_INTRADAY_LOOKBACK_DAYS));
       const recentStart = new Date(endDate.getTime() - daysToMs(PRIORITY_LOOKBACK_DAYS));
       const phases = [];
-      if (sampleStart.getTime() < recentStart.getTime()) {
-        phases.push({ startDate: sampleStart, endDate: recentStart, label: "historical" });
-      }
-      if (dailyStart.getTime() < sampleStart.getTime()) {
-        phases.push({ startDate: dailyStart, endDate: sampleStart, label: "daily-extended" });
-      }
+      appendBackfillPhases(phases, dailyStart, sampleStart, recentStart);
       if (phases.length > 0) {
         log("Backfill historique interrompu — reprise par tranches");
         return { mode: "backfill_resume", phases };
@@ -2947,16 +2946,25 @@
         label: lastDataSync > 0 ? "catch-up" : `priority-${PRIORITY_LOOKBACK_DAYS}d`,
       },
     ];
-    if (sampleStart.getTime() < recentStart.getTime()) {
-      phases.push({ startDate: sampleStart, endDate: recentStart, label: "historical" });
-    }
-    if (dailyStart.getTime() < sampleStart.getTime()) {
-      phases.push({ startDate: dailyStart, endDate: sampleStart, label: "daily-extended" });
-    }
+    appendBackfillPhases(phases, dailyStart, sampleStart, recentStart);
     return {
       mode: fullBackfillAt > 0 ? "backfill_resume" : "phased_initial",
       phases,
     };
+  }
+
+  /**
+   * Backfill arrière-plan : daily-extended (j 91–365) avant historical (j 8–90).
+   * Le backend ne recalcule que les jours du lot courant ; sans HRV plus ancien en
+   * base, recovery_score reste null sur la fenêtre intraday.
+   */
+  function appendBackfillPhases(phases, dailyStart, sampleStart, recentStart) {
+    if (dailyStart.getTime() < sampleStart.getTime()) {
+      phases.push({ startDate: dailyStart, endDate: sampleStart, label: "daily-extended" });
+    }
+    if (sampleStart.getTime() < recentStart.getTime()) {
+      phases.push({ startDate: sampleStart, endDate: recentStart, label: "historical" });
+    }
   }
 
   /** Rattrapage 1 an pour comptes déjà backfillés à 60 j (migration Cyrille). */
@@ -5251,6 +5259,56 @@
     return { applied: false, ...result };
   }
 
+  /**
+   * Réparation 1× j 8–90 : re-envoie HRV compact pour forcer le rescoring recovery
+   * côté backend (comptes backfillés avant inversion daily-extended → historical).
+   */
+  async function maybeRepairRecoveryRescore(Health, token, options) {
+    if (options?.skipRecoveryRescoreRepair || options?.fullLookback) {
+      return { applied: false, reason: "skipped_by_options", token };
+    }
+    if (!isFullBackfillComplete(token)) {
+      return { applied: false, reason: "backfill_incomplete", token };
+    }
+    if (getSyncScopedItem(RECOVERY_RESCORE_REPAIR_KEY, token)) {
+      return { applied: false, reason: "already_done", token };
+    }
+
+    const endDate = new Date(Date.now() - daysToMs(PRIORITY_LOOKBACK_DAYS));
+    const startDate = new Date(Date.now() - daysToMs(SAMPLE_INTRADAY_LOOKBACK_DAYS));
+    if (startDate.getTime() >= endDate.getTime()) {
+      setSyncScopedItem(RECOVERY_RESCORE_REPAIR_KEY, String(Date.now()), token);
+      return { applied: false, reason: "no_window", token };
+    }
+
+    const fromDay = startDate.toISOString().slice(0, 10);
+    const toDay = endDate.toISOString().slice(0, 10);
+    log(
+      `Réparation recovery — re-envoi HRV j ${PRIORITY_LOOKBACK_DAYS + 1}–${SAMPLE_INTRADAY_LOOKBACK_DAYS} (${fromDay} → ${toDay})…`,
+    );
+    log("[sync-session] RECOVERY_RESCORE_REPAIR début");
+
+    const result = await collectAndStreamPost(Health, startDate, endDate, token, {
+      manual: !!options?.manual,
+      phase: "historical",
+      onlyTypes: ["heartRateVariability"],
+      repairStrategy: "healthkit_recovery_rescore_repair",
+    });
+
+    if (result.ok) {
+      setSyncScopedItem(RECOVERY_RESCORE_REPAIR_KEY, String(Date.now()), token);
+      log(
+        `[sync-session] RECOVERY_RESCORE_REPAIR ok samples=${result.sentSamples ?? 0} aggs=${result.sentAggregates ?? 0}`,
+      );
+      return { applied: true, ...result };
+    }
+
+    log(
+      `[sync-session] RECOVERY_RESCORE_REPAIR échec ${result.error ?? result.reason ?? "unknown"}`,
+    );
+    return { applied: false, ...result };
+  }
+
   /** Phase historical (jours 8–90) sans bloquer l'utilisateur après la phase récente. */
   function runBackgroundHistoricalBackfill(Health, phases, token) {
     if (!phases?.length) return;
@@ -5283,6 +5341,16 @@
             clearHistoricalCheckpoint(activeToken);
             log("Backfill arrière-plan annulé — historique déjà présent côté serveur");
             log("[sync-session] BACKFILL_ARRIÈRE_PLAN skip (serveur OK)");
+            try {
+              const recoveryRepair = await maybeRepairRecoveryRescore(Health, activeToken, {
+                manual: false,
+              });
+              activeToken = recoveryRepair?.token ?? activeToken;
+            } catch (recoveryErr) {
+              log(
+                `Réparation recovery exception: ${formatSyncError(recoveryErr, "recovery-rescore-repair")}`,
+              );
+            }
             window.setTimeout(() => {
               if (window.PcpHealthDisplayRefresh?.scheduleRefreshAfterSync) {
                 window.PcpHealthDisplayRefresh.scheduleRefreshAfterSync({
@@ -5346,6 +5414,16 @@
           setHistoricalBackfillPending(activeToken, false);
           setSyncScopedItem(DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY, String(Date.now()), activeToken);
           setSyncScopedItem(SCORING_90D_REPAIR_KEY, String(Date.now()), activeToken);
+          try {
+            const recoveryRepair = await maybeRepairRecoveryRescore(Health, activeToken, {
+              manual: false,
+            });
+            activeToken = recoveryRepair?.token ?? activeToken;
+          } catch (recoveryErr) {
+            log(
+              `Réparation recovery exception: ${formatSyncError(recoveryErr, "recovery-rescore-repair")}`,
+            );
+          }
           log(
             `Backfill journalier ${DAILY_AGGREGATE_LOOKBACK_DAYS}j terminé — prochaines syncs en mode incrémental (${INCREMENTAL_LOOKBACK_HOURS}h)`,
           );
@@ -5522,6 +5600,14 @@
       } catch (scoringRepairErr) {
         log(
           `Réparation intraday scoring 90j exception: ${formatSyncError(scoringRepairErr, "scoring-90d-repair")}`,
+        );
+      }
+      try {
+        const recoveryRepair = await maybeRepairRecoveryRescore(Health, activeToken, options);
+        activeToken = recoveryRepair?.token ?? activeToken;
+      } catch (recoveryRepairErr) {
+        log(
+          `Réparation recovery exception: ${formatSyncError(recoveryRepairErr, "recovery-rescore-repair")}`,
         );
       }
       let merged = null;
@@ -5746,6 +5832,7 @@
     SLEEP_STAGES_REPAIR_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
+    RECOVERY_RESCORE_REPAIR_KEY,
     getItem: getSyncScopedItem,
     setItem: setSyncScopedItem,
     ensurePatientScope: ensureSyncPatientScope,

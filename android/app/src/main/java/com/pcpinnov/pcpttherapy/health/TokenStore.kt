@@ -229,6 +229,18 @@ class TokenStore(private val context: Context) {
         )
     }
 
+    fun getRecoveryRescoreRepairAt(patientId: String): Long =
+        HealthSyncStateStore.getLong(app, patientId, HealthSyncStateStore.KEY_RECOVERY_RESCORE_REPAIR)
+
+    fun setRecoveryRescoreRepairAt(patientId: String, epochMillis: Long) {
+        HealthSyncStateStore.setField(
+            app,
+            patientId,
+            HealthSyncStateStore.KEY_RECOVERY_RESCORE_REPAIR,
+            epochMillis.toString(),
+        )
+    }
+
     fun loadHistoricalCheckpointDoneIndexes(): MutableSet<Int> {
         val pid = resolvePatientId() ?: return mutableSetOf()
         val raw = HealthSyncStateStore.getState(app, pid)[HealthSyncStateStore.KEY_HISTORICAL_CHECKPOINT]
@@ -348,11 +360,11 @@ class TokenStore(private val context: Context) {
             val sampleStart = nowMs - SAMPLE_INTRADAY_LOOKBACK_MS
             val recentStart = nowMs - PRIORITY_LOOKBACK_MS
             val phases = mutableListOf<SyncPhase>()
-            if (sampleStart < recentStart) {
-                phases += SyncPhase(sampleStart, recentStart, "historical")
-            }
             if (dailyStart < sampleStart) {
                 phases += SyncPhase(dailyStart, sampleStart, "daily-extended")
+            }
+            if (sampleStart < recentStart) {
+                phases += SyncPhase(sampleStart, recentStart, "historical")
             }
             if (phases.isNotEmpty()) {
                 Log.i(tag, "Backfill historique interrompu — reprise par tranches")
@@ -367,11 +379,11 @@ class TokenStore(private val context: Context) {
         val phases = mutableListOf(
             SyncPhase(recentStart, nowMs, if (lastDataSync > 0L) "catch-up" else "priority"),
         )
-        if (sampleStart < recentStart) {
-            phases += SyncPhase(sampleStart, recentStart, "historical")
-        }
         if (dailyStart < sampleStart) {
             phases += SyncPhase(dailyStart, sampleStart, "daily-extended")
+        }
+        if (sampleStart < recentStart) {
+            phases += SyncPhase(sampleStart, recentStart, "historical")
         }
         return phases
     }

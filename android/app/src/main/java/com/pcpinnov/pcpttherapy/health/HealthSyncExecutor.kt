@@ -177,6 +177,12 @@ object HealthSyncExecutor {
             Log.w(TAG, "Sleep daily repair: ${e.message}")
             HealthBridge.logToJs("SLEEP_DAILY_REPAIR échec: ${e.message}")
         }
+        try {
+            RecoveryRescoreExecutor.maybeRun(context, store, repository, http)
+        } catch (e: Exception) {
+            Log.w(TAG, "Recovery rescore repair: ${e.message}")
+            HealthBridge.logToJs("RECOVERY_RESCORE_REPAIR échec: ${e.message}")
+        }
     }
 
     suspend fun runHistoricalPhases(
