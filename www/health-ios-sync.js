@@ -5,6 +5,8 @@
 (function () {
   const SYNC_CONST = window.PcpHealthSyncConstants || {};
   const SYNC_ENDPOINT = "/api/v1/patients/me/health/sync";
+  const RECOMPUTE_ENDPOINT = "/api/v1/patients/me/health/recompute";
+  const RECOMPUTE_DAYS_DEFAULT = 90;
   /** Agrégats journaliers + probe serveur — 1 an. */
   const DAILY_AGGREGATE_LOOKBACK_DAYS =
     SYNC_CONST.DAILY_AGGREGATE_LOOKBACK_DAYS ?? 365;
@@ -85,7 +87,8 @@
   /** Réparation 1× intraday scoring j 61–90 (migration 60 → 90 j). */
   const SCORING_90D_REPAIR_KEY = "pcpHealthScoring90dRepairV1";
   /** Réparation 1× recovery j 8–90 : re-envoi vitaux nocturnes pour rescoring backend. */
-  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV2";
+  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV3";
+  const RECOVERY_RESCORE_SLICE_DAYS = 21;
   /** Dernier patient dont l'état sync (backfill / incrémental) a été lu. */
   const SYNC_SCOPE_PATIENT_KEY = "pcpHealthSyncScopePatientId";
   const SYNC_STUCK_RESET_MS = 12 * 60 * 1000;
@@ -3471,9 +3474,10 @@
 
     const onlyTypes = options?.onlyTypes;
     const sleepOnlyRepair = Array.isArray(onlyTypes) && onlyTypes.length === 1 && onlyTypes[0] === "sleep";
+    const vitalsOnlyRepair = Array.isArray(onlyTypes) && onlyTypes.length > 0 && !sleepOnlyRepair;
 
     const [dailyAggsFetched, pluginVersion] = await Promise.all([
-      sleepOnlyRepair
+      sleepOnlyRepair || vitalsOnlyRepair
         ? Promise.resolve([])
         : fetchDailyAggregatesFromHealthKit(Health, startIso, endIsoQuery, errors, grantedSet),
       (async () => {
@@ -4081,6 +4085,22 @@
         errors[result.type] = result.error;
         log(`readSamples(${result.type}) erreur: ${result.error}`);
       }
+    }
+
+    if (vitalsOnlyRepair) {
+      return {
+        ok: true,
+        status: 200,
+        token: postQueue.getToken(),
+        body: postBodies[postBodies.length - 1],
+        payload: { ...baseShell, sync_id: syncId },
+        sentSamples: totalSamples,
+        sentWorkouts: 0,
+        sentAggregates: 0,
+        batched: true,
+        batch_count: postLots,
+        streaming: true,
+      };
     }
 
     const [tempSamples, vo2Samples, workoutsResult] = await Promise.all([
@@ -4925,6 +4945,74 @@
     return { ok: true, status: res.status, body, token: authToken };
   }
 
+  async function postHealthRecompute(token, options) {
+    const quiet = !!(options && options.quiet);
+    const daysRaw = Number(options?.days ?? RECOMPUTE_DAYS_DEFAULT);
+    const days = Number.isFinite(daysRaw) ? Math.min(365, Math.max(1, Math.round(daysRaw))) : RECOMPUTE_DAYS_DEFAULT;
+    let authToken =
+      options?.authToken != null ? options.authToken : await resolveSyncAccessToken(token);
+    if (!authToken) {
+      return {
+        ok: false,
+        status: 401,
+        body: { detail: "Session expired" },
+        error: "Session expired",
+      };
+    }
+
+    const doPost = async (bearer) =>
+      fetch(`${RECOMPUTE_ENDPOINT}?days=${days}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          Accept: "application/json",
+        },
+      });
+
+    let res;
+    try {
+      res = await doPost(authToken);
+    } catch (fetchErr) {
+      return {
+        ok: false,
+        status: 0,
+        body: null,
+        error: formatSyncError(fetchErr, "POST recompute"),
+        token: authToken,
+      };
+    }
+    if (res.status === 401 && window.PcpHealthBridge?.refreshAccessToken) {
+      try {
+        const renewed = await window.PcpHealthBridge.refreshAccessToken();
+        if (renewed) {
+          authToken = renewed;
+          res = await doPost(renewed);
+        }
+      } catch (refreshErr) {
+        if (!quiet) log(formatSyncError(refreshErr, "refresh token (recompute)"));
+      }
+    }
+
+    const raw = await res.text();
+    let body;
+    try {
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      body = { raw };
+    }
+    if (!res.ok) {
+      const detail =
+        body?.detail != null
+          ? typeof body.detail === "string"
+            ? body.detail
+            : JSON.stringify(body.detail)
+          : raw.slice(0, 400);
+      if (!quiet) log(`POST recompute HTTP ${res.status} — ${String(detail).slice(0, 300)}`);
+      return { ok: false, status: res.status, body, error: detail, token: authToken };
+    }
+    return { ok: true, status: res.status, body, token: authToken, days };
+  }
+
   function storeSyncSummary(detail) {
     try {
       sessionStorage.setItem(
@@ -5369,6 +5457,23 @@
    * Réparation 1× j 8–90 : re-envoie vitaux nuit (HRV, resp, SpO₂, FC repos) pour
    * forcer le rescoring recovery côté backend une fois daily-extended terminé.
    */
+  function buildRecoveryRescoreSlices() {
+    const endMs = Date.now() - daysToMs(PRIORITY_LOOKBACK_DAYS);
+    const startMs = Date.now() - daysToMs(SAMPLE_INTRADAY_LOOKBACK_DAYS);
+    if (startMs >= endMs) return [];
+    const slices = [];
+    let sliceEndMs = endMs;
+    while (sliceEndMs > startMs) {
+      const sliceStartMs = Math.max(startMs, sliceEndMs - daysToMs(RECOVERY_RESCORE_SLICE_DAYS));
+      slices.push({
+        startDate: new Date(sliceStartMs),
+        endDate: new Date(sliceEndMs),
+      });
+      sliceEndMs = sliceStartMs;
+    }
+    return slices;
+  }
+
   async function maybeRepairRecoveryRescore(Health, token, options) {
     if (options?.skipRecoveryRescoreRepair || options?.fullLookback) {
       return { applied: false, reason: "skipped_by_options", token };
@@ -5380,44 +5485,57 @@
       return { applied: false, reason: "already_done", token };
     }
 
-    const endDate = new Date(Date.now() - daysToMs(PRIORITY_LOOKBACK_DAYS));
-    const startDate = new Date(Date.now() - daysToMs(SAMPLE_INTRADAY_LOOKBACK_DAYS));
-    if (startDate.getTime() >= endDate.getTime()) {
+    const slices = buildRecoveryRescoreSlices();
+    if (slices.length === 0) {
       setSyncScopedItem(RECOVERY_RESCORE_REPAIR_KEY, String(Date.now()), token);
       return { applied: false, reason: "no_window", token };
     }
 
-    const fromDay = startDate.toISOString().slice(0, 10);
-    const toDay = endDate.toISOString().slice(0, 10);
+    const fromDay = slices[slices.length - 1].startDate.toISOString().slice(0, 10);
+    const toDay = slices[0].endDate.toISOString().slice(0, 10);
     log(
-      `Réparation recovery — re-envoi HRV j ${PRIORITY_LOOKBACK_DAYS + 1}–${SAMPLE_INTRADAY_LOOKBACK_DAYS} (${fromDay} → ${toDay})…`,
+      `Réparation recovery — re-envoi vitaux nuit j ${PRIORITY_LOOKBACK_DAYS + 1}–${SAMPLE_INTRADAY_LOOKBACK_DAYS} (${fromDay} → ${toDay}, ${slices.length} tranche(s))…`,
     );
     log("[sync-session] RECOVERY_RESCORE_REPAIR début");
 
-    const result = await collectAndStreamPost(Health, startDate, endDate, token, {
-      manual: !!options?.manual,
-      phase: "historical",
-      onlyTypes: [
-        "heartRateVariability",
-        "respiratoryRate",
-        "oxygenSaturation",
-        "restingHeartRate",
-      ],
-      repairStrategy: "healthkit_recovery_rescore_repair",
-    });
-
-    if (result.ok) {
-      setSyncScopedItem(RECOVERY_RESCORE_REPAIR_KEY, String(Date.now()), token);
+    const repairTypes = [
+      "heartRateVariability",
+      "respiratoryRate",
+      "oxygenSaturation",
+      "restingHeartRate",
+    ];
+    let activeToken = token;
+    let sentSamples = 0;
+    for (let i = 0; i < slices.length; i++) {
+      const slice = slices[i];
       log(
-        `[sync-session] RECOVERY_RESCORE_REPAIR ok samples=${result.sentSamples ?? 0} aggs=${result.sentAggregates ?? 0}`,
+        `Réparation recovery tranche ${i + 1}/${slices.length} (${slice.startDate.toISOString().slice(0, 10)} → ${slice.endDate.toISOString().slice(0, 10)})…`,
       );
-      return { applied: true, ...result };
+      const result = await collectAndStreamPost(
+        Health,
+        slice.startDate,
+        slice.endDate,
+        activeToken,
+        {
+          manual: !!options?.manual,
+          phase: "historical",
+          onlyTypes: repairTypes,
+          repairStrategy: "healthkit_recovery_rescore_repair",
+        },
+      );
+      activeToken = result.token ?? activeToken;
+      if (!result.ok) {
+        log(
+          `[sync-session] RECOVERY_RESCORE_REPAIR échec tranche ${i + 1}/${slices.length} ${result.error ?? result.reason ?? "unknown"}`,
+        );
+        return { applied: false, ...result, token: activeToken };
+      }
+      sentSamples += result.sentSamples ?? 0;
     }
 
-    log(
-      `[sync-session] RECOVERY_RESCORE_REPAIR échec ${result.error ?? result.reason ?? "unknown"}`,
-    );
-    return { applied: false, ...result };
+    setSyncScopedItem(RECOVERY_RESCORE_REPAIR_KEY, String(Date.now()), activeToken);
+    log(`[sync-session] RECOVERY_RESCORE_REPAIR ok samples=${sentSamples} slices=${slices.length}`);
+    return { applied: true, ok: true, sentSamples, token: activeToken };
   }
 
   /** Phase historical (jours 8–90) sans bloquer l'utilisateur après la phase récente. */
@@ -5461,6 +5579,22 @@
               log(
                 `Réparation recovery exception: ${formatSyncError(recoveryErr, "recovery-rescore-repair")}`,
               );
+            }
+            try {
+              const recompute = await postHealthRecompute(activeToken, {
+                authToken: activeToken,
+                quiet: true,
+              });
+              activeToken = recompute?.token ?? activeToken;
+              if (recompute?.ok) {
+                log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+              } else {
+                log(
+                  `[sync-session] RECOMPUTE_SCORES échec ${recompute?.status ?? 0} ${recompute?.error ?? recompute?.reason ?? "unknown"}`,
+                );
+              }
+            } catch (recomputeErr) {
+              log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
             }
             window.setTimeout(() => {
               if (window.PcpHealthDisplayRefresh?.scheduleRefreshAfterSync) {
@@ -5534,6 +5668,22 @@
             log(
               `Réparation recovery exception: ${formatSyncError(recoveryErr, "recovery-rescore-repair")}`,
             );
+          }
+          try {
+            const recompute = await postHealthRecompute(activeToken, {
+              authToken: activeToken,
+              quiet: true,
+            });
+            activeToken = recompute?.token ?? activeToken;
+            if (recompute?.ok) {
+              log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+            } else {
+              log(
+                `[sync-session] RECOMPUTE_SCORES échec ${recompute?.status ?? 0} ${recompute?.error ?? recompute?.reason ?? "unknown"}`,
+              );
+            }
+          } catch (recomputeErr) {
+            log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
           }
           log(
             `Backfill journalier ${DAILY_AGGREGATE_LOOKBACK_DAYS}j terminé — prochaines syncs en mode incrémental (${INCREMENTAL_LOOKBACK_HOURS}h)`,
@@ -5852,6 +6002,25 @@
         runBackgroundHistoricalBackfill(Health, backgroundPhases, activeToken);
       } else if (syncPlan.phases.some((p) => BACKGROUND_PHASE_LABELS.has(p.label))) {
         setHistoricalBackfillPending(activeToken || token, false);
+      }
+      if (!backfillPending) {
+        try {
+          const recompute = await postHealthRecompute(activeToken || token, {
+            authToken: activeToken || token,
+            quiet: true,
+            days: options?.recomputeDays,
+          });
+          activeToken = recompute?.token ?? activeToken;
+          if (recompute?.ok) {
+            log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+          } else {
+            log(
+              `[sync-session] RECOMPUTE_SCORES échec ${recompute?.status ?? 0} ${recompute?.error ?? recompute?.reason ?? "unknown"}`,
+            );
+          }
+        } catch (recomputeErr) {
+          log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
+        }
       }
       logSyncPostResponse(body);
       const totalSec = Math.round((Date.now() - syncStartedAt) / 1000);

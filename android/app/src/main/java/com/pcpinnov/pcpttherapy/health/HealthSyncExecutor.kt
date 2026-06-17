@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 object HealthSyncExecutor {
 
     private const val TAG = "HealthSyncExecutor"
+    private const val RECOMPUTE_DAYS_DEFAULT = 90
     private const val MAX_POST_BYTES = 450_000
     private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
     private val backfillRunning = AtomicBoolean(false)
@@ -154,6 +155,19 @@ object HealthSyncExecutor {
         }
 
         runPostSyncRepairs(app, store, repository)
+        try {
+            val recompute = postRecomputeScores(store, token, RECOMPUTE_DAYS_DEFAULT, http)
+            when (recompute) {
+                is PostResult.Success -> HealthBridge.logToJs("RECOMPUTE_SCORES ok days=$RECOMPUTE_DAYS_DEFAULT")
+                is PostResult.AuthFailure -> HealthBridge.logToJs("RECOMPUTE_SCORES auth_${recompute.code}")
+                is PostResult.ClientError -> HealthBridge.logToJs("RECOMPUTE_SCORES http_${recompute.code}")
+                is PostResult.ServerError -> HealthBridge.logToJs("RECOMPUTE_SCORES http_${recompute.code}")
+                is PostResult.NetworkError -> HealthBridge.logToJs("RECOMPUTE_SCORES network ${recompute.message}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Recompute scores: ${e.message}")
+            HealthBridge.logToJs("RECOMPUTE_SCORES échec: ${e.message}")
+        }
 
         Outcome.SUCCESS
     }
@@ -213,6 +227,10 @@ object HealthSyncExecutor {
                     Log.i(TAG, "Backfill arrière-plan annulé — serveur déjà à jour")
                     val repository = HealthSyncRepository(app)
                     runPostSyncRepairs(app, store, repository)
+                    val recompute = postRecomputeScores(store, token, RECOMPUTE_DAYS_DEFAULT, http)
+                    if (recompute is PostResult.Success) {
+                        HealthBridge.logToJs("RECOMPUTE_SCORES ok days=$RECOMPUTE_DAYS_DEFAULT")
+                    }
                     outcome = Outcome.SUCCESS
                     finishReason = "server_skip"
                     return@withContext outcome
@@ -226,6 +244,10 @@ object HealthSyncExecutor {
             if (result.outcome == Outcome.SUCCESS) {
                 store.setBackfillPending(false)
                 runPostSyncRepairs(app, store, repository)
+                val recompute = postRecomputeScores(store, token, RECOMPUTE_DAYS_DEFAULT, http)
+                if (recompute is PostResult.Success) {
+                    HealthBridge.logToJs("RECOMPUTE_SCORES ok days=$RECOMPUTE_DAYS_DEFAULT")
+                }
             }
             outcome = result.outcome
             if (outcome != Outcome.SUCCESS) {
@@ -570,6 +592,37 @@ object HealthSyncExecutor {
                             aggregatesInserted = json.optInt("aggregates_inserted", 0),
                         )
                     }
+                    401, 403 -> PostResult.AuthFailure(response.code)
+                    in 400..499 -> PostResult.ClientError(response.code, raw.take(300))
+                    in 500..599 -> PostResult.ServerError(response.code, raw.take(300))
+                    else -> PostResult.ClientError(response.code, raw.take(300))
+                }
+            }
+        } catch (e: Exception) {
+            PostResult.NetworkError(e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun postRecomputeScores(
+        store: TokenStore,
+        token: String,
+        days: Int,
+        client: OkHttpClient,
+    ): PostResult {
+        val clampedDays = days.coerceIn(1, 365)
+        val url = "${store.getApiBase().trimEnd('/')}/api/v1/patients/me/health/recompute?days=$clampedDays"
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $token")
+            .header("Accept", "application/json")
+            .post(ByteArray(0).toRequestBody(JSON_MEDIA))
+            .build()
+
+        return try {
+            client.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                when (response.code) {
+                    in 200..299 -> PostResult.Success(samplesInserted = 0, aggregatesInserted = 0)
                     401, 403 -> PostResult.AuthFailure(response.code)
                     in 400..499 -> PostResult.ClientError(response.code, raw.take(300))
                     in 500..599 -> PostResult.ServerError(response.code, raw.take(300))

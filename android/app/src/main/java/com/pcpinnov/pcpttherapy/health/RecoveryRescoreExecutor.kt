@@ -10,18 +10,36 @@ import java.time.ZoneId
 import java.util.UUID
 
 /**
- * Réparation 1× j 8–90 : re-envoie vitaux compacts (horaire nocturne) pour rescoring
- * backend sur les comptes déjà syncés avec timestamps midi.
+ * Réparation 1× j 8–90 : re-envoie vitaux compacts (horaire nocturne) par tranches
+ * pour rescoring recovery backend une fois daily-extended terminé.
  */
 object RecoveryRescoreExecutor {
 
     private const val TAG = "RecoveryRescoreRepair"
+    private const val SLICE_MS = 21L * 24L * 60L * 60L * 1000L
 
     private val REPAIR_TYPES = listOf(
         "heartRateVariability",
         "respiratoryRate",
         "oxygenSaturation",
+        "restingHeartRate",
     )
+
+    private data class Slice(val startMs: Long, val endMs: Long)
+
+    private fun buildSlices(now: Long): List<Slice> {
+        val end = now - TokenStore.PRIORITY_LOOKBACK_MS
+        val start = now - TokenStore.SAMPLE_INTRADAY_LOOKBACK_MS
+        if (start >= end) return emptyList()
+        val out = mutableListOf<Slice>()
+        var sliceEnd = end
+        while (sliceEnd > start) {
+            val sliceStart = maxOf(start, sliceEnd - SLICE_MS)
+            out += Slice(sliceStart, sliceEnd)
+            sliceEnd = sliceStart
+        }
+        return out
+    }
 
     suspend fun maybeRun(
         context: Context,
@@ -34,85 +52,93 @@ object RecoveryRescoreExecutor {
         if (store.getFullBackfillAt(patientId) <= 0L) return@withContext false
 
         val now = System.currentTimeMillis()
-        val end = now - TokenStore.PRIORITY_LOOKBACK_MS
-        val start = now - TokenStore.SAMPLE_INTRADAY_LOOKBACK_MS
-        if (start >= end) {
+        val slices = buildSlices(now)
+        if (slices.isEmpty()) {
             store.setRecoveryRescoreRepairAt(patientId, now)
             return@withContext false
         }
 
-        val ctx = repository.beginCollectContext()
-        val startInst = Instant.ofEpochMilli(start)
-        val endInst = Instant.ofEpochMilli(end)
         val zone = ZoneId.systemDefault()
-
-        val sleepRaw = repository.readSampleType(ctx, "sleep", startInst, endInst)
-        val nightIndex = HistoricalLightCompactor.buildWakeDayNightTimestampIndex(
-            sleepRaw,
-            ctx.dailyByDay,
-            zone,
-            historicalLight = true,
-        )
-
-        val merged = linkedMapOf<String, List<SamplePoint>>()
         var totalSamples = 0
-        for (type in REPAIR_TYPES) {
-            val raw = repository.readSampleType(ctx, type, startInst, endInst)
-            if (raw.isEmpty()) continue
-            val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(
-                raw,
-                type,
+        Log.i(TAG, "RECOVERY_RESCORE_REPAIR début — ${slices.size} tranche(s)")
+        HealthBridge.logToJs("[sync-session] RECOVERY_RESCORE_REPAIR début slices=${slices.size}")
+
+        for ((idx, slice) in slices.withIndex()) {
+            val sliceNum = idx + 1
+            val startInst = Instant.ofEpochMilli(slice.startMs)
+            val endInst = Instant.ofEpochMilli(slice.endMs)
+            val ctx = repository.beginCollectContext()
+
+            val sleepRaw = repository.readSampleType(ctx, "sleep", startInst, endInst)
+            val nightIndex = HistoricalLightCompactor.buildWakeDayNightTimestampIndex(
+                sleepRaw,
+                ctx.dailyByDay,
                 zone,
-                nightIndex,
+                historicalLight = true,
             )
-            if (collapsed.isEmpty()) continue
-            merged[type] = collapsed
-            totalSamples += collapsed.size
+
+            val merged = linkedMapOf<String, List<SamplePoint>>()
+            var sliceSamples = 0
+            for (type in REPAIR_TYPES) {
+                val raw = repository.readSampleType(ctx, type, startInst, endInst)
+                if (raw.isEmpty()) continue
+                val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(
+                    raw,
+                    type,
+                    zone,
+                    nightIndex,
+                )
+                if (collapsed.isEmpty()) continue
+                merged[type] = collapsed
+                sliceSamples += collapsed.size
+            }
+
+            if (merged.isEmpty()) {
+                Log.i(TAG, "RECOVERY_RESCORE_REPAIR tranche $sliceNum/${slices.size} — aucun vital")
+                continue
+            }
+
+            Log.i(TAG, "RECOVERY_RESCORE_REPAIR tranche $sliceNum/${slices.size} — $sliceSamples sample(s)")
+            val payload = repository.buildPartialPayload(
+                ctx,
+                startInst,
+                endInst,
+                merged,
+                emptyList(),
+                emptyList(),
+            )
+            val body = HealthSyncPayloadBuilder.build(
+                payload = payload,
+                syncId = UUID.randomUUID(),
+                phaseLabel = "recovery-rescore-repair",
+                includeDailyAggregates = false,
+            )
+            body.optJSONObject("fetch")?.put("strategy", "healthkit_recovery_rescore_repair")
+
+            when (val post = HealthSyncExecutor.postSyncPublic(store, http, body)) {
+                is HealthSyncExecutor.PostResult.Success -> {
+                    totalSamples += sliceSamples
+                }
+                else -> {
+                    Log.w(TAG, "RECOVERY_RESCORE_REPAIR échec tranche $sliceNum/${slices.size}")
+                    HealthBridge.logToJs(
+                        "[sync-session] RECOVERY_RESCORE_REPAIR échec tranche $sliceNum/${slices.size}",
+                    )
+                    return@withContext false
+                }
+            }
         }
 
-        if (merged.isEmpty()) {
+        if (totalSamples <= 0) {
             Log.i(TAG, "RECOVERY_RESCORE_REPAIR skip — aucun vital compact j 8–90")
             return@withContext false
         }
 
-        Log.i(
-            TAG,
-            "RECOVERY_RESCORE_REPAIR début — ${merged.size} type(s), $totalSamples sample(s)",
-        )
+        store.setRecoveryRescoreRepairAt(patientId, now)
+        Log.i(TAG, "RECOVERY_RESCORE_REPAIR ok samples=$totalSamples slices=${slices.size}")
         HealthBridge.logToJs(
-            "[sync-session] RECOVERY_RESCORE_REPAIR début samples=$totalSamples",
+            "[sync-session] RECOVERY_RESCORE_REPAIR ok samples=$totalSamples slices=${slices.size}",
         )
-
-        val payload = repository.buildPartialPayload(
-            ctx,
-            startInst,
-            endInst,
-            merged,
-            emptyList(),
-            emptyList(),
-        )
-        val body = HealthSyncPayloadBuilder.build(
-            payload = payload,
-            syncId = UUID.randomUUID(),
-            phaseLabel = "recovery-rescore-repair",
-            includeDailyAggregates = false,
-        )
-        body.optJSONObject("fetch")?.put("strategy", "healthkit_recovery_rescore_repair")
-
-        when (val post = HealthSyncExecutor.postSyncPublic(store, http, body)) {
-            is HealthSyncExecutor.PostResult.Success -> {
-                store.setRecoveryRescoreRepairAt(patientId, now)
-                Log.i(TAG, "RECOVERY_RESCORE_REPAIR ok samples=$totalSamples")
-                HealthBridge.logToJs(
-                    "[sync-session] RECOVERY_RESCORE_REPAIR ok samples=$totalSamples",
-                )
-                true
-            }
-            else -> {
-                Log.w(TAG, "RECOVERY_RESCORE_REPAIR échec")
-                HealthBridge.logToJs("[sync-session] RECOVERY_RESCORE_REPAIR échec")
-                false
-            }
-        }
+        true
     }
 }
