@@ -18,8 +18,9 @@
   const MIN_HISTORICAL_STAGED_NIGHTS = 20;
   /** En dessous : pas assez de nuits pour exiger l'historique stades. */
   const MIN_HISTORICAL_SLEEP_NIGHTS_TO_REQUIRE = 10;
-  const SLEEP_SAMPLES_PROBE_MAX_PAGES = 8;
+  const SLEEP_SAMPLES_PROBE_MAX_PAGES = 16;
   const SYNTHETIC_SLEEP_PLATFORM_RE = /^sleep\|agg\|/i;
+  const HIST_COMPACT_SLEEP_PLATFORM_RE = /^sleep\|hist\|/i;
 
   function formatDateOnly(d) {
     const y = d.getFullYear();
@@ -211,6 +212,13 @@
     return formatDateOnly(d);
   }
 
+  /** Fenêtre stades sommeil = j 8–{intraday} (pas toute l'année). */
+  function historicalStagesDayFromStr() {
+    const d = new Date();
+    d.setDate(d.getDate() - SAMPLE_INTRADAY_LOOKBACK_DAYS);
+    return formatDateOnly(d);
+  }
+
   function isHistoricalDay(dayStr, dayFromStr, cutoffStr) {
     if (!dayStr || !dayFromStr || !cutoffStr) return false;
     return dayStr >= dayFromStr && dayStr < cutoffStr;
@@ -224,14 +232,29 @@
     return false;
   }
 
+  function sleepSampleStage(item) {
+    if (!item) return "";
+    const extraStage = item.extra?.stage;
+    if (extraStage != null && String(extraStage).trim()) return String(extraStage).trim();
+    if (item.stage != null && String(item.stage).trim()) return String(item.stage).trim();
+    return "";
+  }
+
+  function isHistCompactStagedSleepSample(item) {
+    const pid = String(item?.platform_id ?? item?.platformId ?? "");
+    if (!HIST_COMPACT_SLEEP_PLATFORM_RE.test(pid)) return false;
+    const stage = sleepSampleStage(item);
+    return stage.length > 0 && stage !== "night";
+  }
+
   function isRealStagedSleepSample(item) {
     if (!item) return false;
     const dtype = item.data_type ?? item.dataType;
     if (dtype !== "sleep") return false;
     if (isSyntheticSleepSample(item)) return false;
-    const stage = String(item.extra?.stage ?? "").trim();
-    if (!stage) return false;
-    return true;
+    if (isHistCompactStagedSleepSample(item)) return true;
+    const stage = sleepSampleStage(item);
+    return stage.length > 0 && stage !== "night";
   }
 
   function wakeDayFromSleepSample(item) {
@@ -246,6 +269,16 @@
       if (Number(row.sleep_total_min) > 0) count += 1;
     }
     return count;
+  }
+
+  function listHistoricalNightsWithSleep(rows, dayFromStr, cutoffStr) {
+    const nights = new Set();
+    for (const row of rows ?? []) {
+      const day = row?.day;
+      if (!isHistoricalDay(day, dayFromStr, cutoffStr)) continue;
+      if (Number(row.sleep_total_min) > 0) nights.add(day);
+    }
+    return [...nights].sort();
   }
 
   function evaluateSleepStagesCoverage(rows, sleepSamples, dayFromStr) {
@@ -265,6 +298,8 @@
     }
 
     const stagedCount = stagedNights.size;
+    const nightsWithSleep = listHistoricalNightsWithSleep(rows, dayFromStr, cutoffStr);
+    const missingWakeDays = nightsWithSleep.filter((day) => !stagedNights.has(day));
     const needsRepair =
       historicalSleepNights >= MIN_HISTORICAL_SLEEP_NIGHTS_TO_REQUIRE &&
       stagedCount < MIN_HISTORICAL_STAGED_NIGHTS &&
@@ -275,6 +310,8 @@
       reason: needsRepair ? "sleep_stages_insufficient" : "ok",
       historicalSleepNights,
       stagedHistoricalNights: stagedCount,
+      missingWakeDays,
+      missingWakeDayCount: missingWakeDays.length,
       syntheticHistoricalSamples: syntheticHistorical,
       historicalCutoff: cutoffStr,
       dayFrom: dayFromStr,
@@ -286,12 +323,15 @@
     const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
     const maxPages =
       (options && options.sleepSampleMaxPages) || SLEEP_SAMPLES_PROBE_MAX_PAGES;
+    const cutoffStr = (options && options.dateToStr) || historicalCutoffDayStr();
     const dateFrom = `${dayFromStr}T00:00:00.000Z`;
+    const dateTo = `${cutoffStr}T23:59:59.999Z`;
     const items = [];
 
     for (let page = 1; page <= maxPages; page++) {
       const url =
         `/api/v1/patients/me/health/samples?data_type=sleep&date_from=${encodeURIComponent(dateFrom)}` +
+        `&date_to=${encodeURIComponent(dateTo)}` +
         `&page=${page}&page_size=500&sort_order=desc`;
       const res = await fetch(url, { headers, cache: "no-store" });
       if (!res.ok) {
@@ -313,9 +353,8 @@
       return { sufficient: true, reason: "no_token", skipped: true };
     }
 
-    const lookbackDays = (options && options.lookbackDays) || FULL_LOOKBACK_DAYS;
-    const dayFrom = new Date(Date.now() - lookbackDays * MS_PER_DAY);
-    const dayFromStr = formatDateOnly(dayFrom);
+    const stagesDayFromStr = historicalStagesDayFromStr();
+    const cutoffStr = historicalCutoffDayStr();
 
     let rows = options && options.rows;
     if (!Array.isArray(rows)) {
@@ -324,7 +363,10 @@
     }
 
     try {
-      const sampleFetch = await fetchSleepSamplesForProbe(token, dayFromStr, options);
+      const sampleFetch = await fetchSleepSamplesForProbe(token, stagesDayFromStr, {
+        ...(options || {}),
+        dateToStr: cutoffStr,
+      });
       if (sampleFetch.httpStatus && sampleFetch.httpStatus >= 400) {
         return {
           sufficient: true,
@@ -333,19 +375,21 @@
           dayFrom: dayFromStr,
         };
       }
-      const coverage = evaluateSleepStagesCoverage(rows, sampleFetch.items, dayFromStr);
+      const coverage = evaluateSleepStagesCoverage(rows, sampleFetch.items, stagesDayFromStr);
       return {
         ...coverage,
         sampleCount: sampleFetch.items.length,
         samplesTruncated: !!sampleFetch.truncated,
         totalSamples: sampleFetch.total ?? sampleFetch.items.length,
+        stagesWindowFrom: stagesDayFromStr,
+        stagesWindowTo: cutoffStr,
       };
     } catch (err) {
       return {
         sufficient: true,
         reason: String(err?.message ?? err).slice(0, 120) || "fetch_error",
         skipped: true,
-        dayFrom: dayFromStr,
+        dayFrom: stagesDayFromStr,
       };
     }
   }
@@ -485,6 +529,8 @@
     probeServerSleepStagesCoverage,
     evaluateSleepStagesCoverage,
     isRealStagedSleepSample,
+    historicalStagesDayFromStr,
+    historicalCutoffDayStr,
     maybeSkipBackfillFromServer,
   };
 })();

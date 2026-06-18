@@ -98,6 +98,23 @@ object RecoveryRescoreExecutor {
                 continue
             }
 
+            val wakeDays = merged.values.flatten()
+                .map { HistoricalLightCompactor.vitalWakeDayFromInstant(it.startAt, zone) }
+                .toSet()
+            val companions = HistoricalLightCompactor.buildCompanionSleepForWakeDays(
+                wakeDays,
+                sleepRaw,
+                zone,
+            )
+            if (companions.isNotEmpty()) {
+                merged["sleep"] = companions
+                sliceSamples += companions.size
+                Log.i(
+                    TAG,
+                    "RECOVERY_RESCORE_REPAIR tranche $sliceNum/${slices.size} — ${companions.size} sommeil compagnon",
+                )
+            }
+
             Log.i(TAG, "RECOVERY_RESCORE_REPAIR tranche $sliceNum/${slices.size} — $sliceSamples sample(s)")
             val payload = repository.buildPartialPayload(
                 ctx,

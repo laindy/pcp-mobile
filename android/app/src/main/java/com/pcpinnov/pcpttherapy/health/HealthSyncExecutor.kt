@@ -100,11 +100,7 @@ object HealthSyncExecutor {
             Log.w(TAG, "Steps repair: ${e.message}")
         }
 
-        try {
-            SleepStagesRepairExecutor.maybeRun(app, store, repository, http)
-        } catch (e: Exception) {
-            Log.w(TAG, "Sleep stages repair: ${e.message}")
-        }
+        BackgroundSleepStagesRepair.enqueue(app, store, repository, http)
 
         try {
             ServerBackfillProbe.tryMarkComplete(store, http)

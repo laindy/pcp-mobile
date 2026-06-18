@@ -81,13 +81,16 @@
   /** Réparation 1× des steps_total effacés après backfill compact (post-fix scoring steps). */
   const STEPS_REPAIR_KEY = "pcpHealthStepsRepairV2";
   /** Réparation 1× des stades sommeil historiques (j 8–90) pour constance / réparateur. */
-  const SLEEP_STAGES_REPAIR_KEY = "pcpHealthSleepStagesRepairV1";
+  const SLEEP_STAGES_REPAIR_KEY = "pcpHealthSleepStagesRepairV2";
+  const SLEEP_STAGES_REPAIR_ATTEMPTS_KEY = "pcpHealthSleepStagesRepairAttemptsV2";
+  const SLEEP_STAGES_REPAIR_MAX_ATTEMPTS = 2;
+  const SLEEP_STAGES_GAP_BATCH_DAYS = 14;
   /** Réparation 1× sommeil + workouts + vitaux en daily-extended (j 91–365). */
   const DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY = "pcpHealthDailyExtendedSleepWorkoutRepairV2";
   /** Réparation 1× intraday scoring j 61–90 (migration 60 → 90 j). */
   const SCORING_90D_REPAIR_KEY = "pcpHealthScoring90dRepairV1";
   /** Réparation 1× recovery j 8–90 : re-envoi vitaux nocturnes pour rescoring backend. */
-  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV3";
+  const RECOVERY_RESCORE_REPAIR_KEY = "pcpHealthRecoveryRescoreRepairV4";
   const RECOVERY_RESCORE_SLICE_DAYS = 21;
   /** Dernier patient dont l'état sync (backfill / incrémental) a été lu. */
   const SYNC_SCOPE_PATIENT_KEY = "pcpHealthSyncScopePatientId";
@@ -103,6 +106,7 @@
     AGGREGATES_BACKFILL_KEY,
     STEPS_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
+    SLEEP_STAGES_REPAIR_ATTEMPTS_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
     RECOVERY_RESCORE_REPAIR_KEY,
@@ -112,6 +116,7 @@
     LAST_DATA_SYNC_KEY,
     STEPS_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
+    SLEEP_STAGES_REPAIR_ATTEMPTS_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
     RECOVERY_RESCORE_REPAIR_KEY,
@@ -288,6 +293,11 @@
       log(
         `Compte patient changé — backfill ${FULL_LOOKBACK_DAYS}j requis pour ce compte (état sync par patient)`,
       );
+      try {
+        if (window.PcpHealthDisplayRefresh?.invalidateHealthQueries) {
+          void window.PcpHealthDisplayRefresh.invalidateHealthQueries();
+        }
+      } catch (_) {}
     }
     sessionStorage.setItem(SYNC_SCOPE_PATIENT_KEY, pid);
     window.__pcpHealthSyncPatientId = pid;
@@ -3085,6 +3095,80 @@
     return dailyWakeFallbackIso(wakeDay);
   }
 
+  /** Plus long segment sommeil réel par jour de réveil (hors inBed/awake). */
+  function pickBestSleepSegmentPerWakeDay(stagedSleep) {
+    const best = new Map();
+    for (const s of stagedSleep ?? []) {
+      const stage = s?.extra?.stage ?? s?.stage ?? null;
+      if (isNonSleepStageForVitalIndex(stage)) continue;
+      const startMs = new Date(s.startDate).getTime();
+      const endMs = new Date(s.endDate ?? s.startDate).getTime();
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue;
+      const wakeDay = localDayKey(new Date(endMs).toISOString());
+      const dur = endMs - startMs;
+      const prev = best.get(wakeDay);
+      if (!prev || dur > prev.dur) best.set(wakeDay, { dur, sample: s });
+    }
+    const out = new Map();
+    for (const [k, v] of best) out.set(k, v.sample);
+    return out;
+  }
+
+  /**
+   * 1 segment sommeil par jour de réveil des vitaux réparés — permet au backend
+   * d'attribuer HRV/resp/SpO₂ nocturnes même si le sommeil n'avait pas été syncé.
+   */
+  function buildCompanionSleepSamplesForWakeDays(wakeDays, stagedSleep) {
+    const byWake = pickBestSleepSegmentPerWakeDay(stagedSleep);
+    const out = [];
+    for (const wakeDay of wakeDays) {
+      const existing = byWake.get(wakeDay);
+      if (existing) {
+        out.push(existing);
+        continue;
+      }
+      const startDate = `${addDayKey(wakeDay, -1)}T22:00:00.000Z`;
+      const endDate = `${wakeDay}T10:00:00.000Z`;
+      const norm = buildSleepStageSample(
+        { sourceName: "healthkit" },
+        "asleep",
+        startDate,
+        endDate,
+        `sleep|companion|${wakeDay}`,
+        "companion",
+      );
+      if (norm) out.push(norm);
+    }
+    return out;
+  }
+
+  async function loadStagedSleepForCompanion(Health, startIso, endIsoQuery) {
+    const sleepRead = await readAllSleepSamples(Health, startIso, endIsoQuery, { light: true });
+    let sleepSamples = buildSleepCompactStagedSamplesFromRaw(sleepRead.raw ?? []);
+    if (!sleepSamples.length && sleepRead.dailyRows?.length) {
+      sleepSamples = buildSleepSyntheticFromDailyRows(sleepRead.dailyRows);
+    }
+    return sleepSamples;
+  }
+
+  async function buildRecoveryCompanionSleepForSlice(Health, slice, repairTypes) {
+    const startIso = slice.startDate.toISOString();
+    const endIsoQuery = new Date(slice.endDate.getTime() + 60 * 1000).toISOString();
+    const stagedSleep = await loadStagedSleepForCompanion(Health, startIso, endIsoQuery);
+    const nightIndex = buildWakeDayNightTimestampIndex(stagedSleep);
+    const wakeDays = new Set();
+    for (const type of repairTypes) {
+      const chunkRead = await readAllSamplesByDateChunks(Health, type, startIso, endIsoQuery);
+      const collapsed = collapseVitalSamplesToDailySynthetic(
+        chunkRead.samples ?? [],
+        type,
+        nightIndex,
+      );
+      for (const s of collapsed) wakeDays.add(vitalWakeDayFromIso(s.startDate));
+    }
+    return buildCompanionSleepSamplesForWakeDays([...wakeDays], stagedSleep);
+  }
+
   async function loadVitalNightIndex(Health, startIso, endIsoQuery, historicalLight, sleepLight) {
     try {
       const sleepRead = await readAllSleepSamples(Health, startIso, endIsoQuery, {
@@ -3107,6 +3191,34 @@
     }
   }
 
+  function addCalendarDays(dayStr, delta) {
+    const parts = String(dayStr).split("-").map(Number);
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dayStr;
+    const dt = new Date(parts[0], parts[1] - 1, parts[2]);
+    dt.setDate(dt.getDate() + delta);
+    return localDayKey(dt.toISOString());
+  }
+
+  function wakeDaysToReadWindow(wakeDays) {
+    if (!wakeDays?.length) return null;
+    const sorted = [...wakeDays].sort();
+    const minDay = sorted[0];
+    const maxDay = sorted[sorted.length - 1];
+    return {
+      startIso: new Date(`${addCalendarDays(minDay, -1)}T12:00:00.000Z`).toISOString(),
+      endIso: new Date(`${addCalendarDays(maxDay, 1)}T14:00:00.000Z`).toISOString(),
+    };
+  }
+
+  function filterSleepSamplesForWakeDays(samples, wakeDaySet) {
+    if (!wakeDaySet?.size) return samples ?? [];
+    return (samples ?? []).filter((s) => {
+      const wake = localDayKey(s.endDate ?? s.end_at ?? s.endAt);
+      return wake && wakeDaySet.has(wake);
+    });
+  }
+
+  let __pcpSleepStagesRepairRunning = false;
   const HISTORICAL_LIGHT_PHASES = new Set(["historical", "bg-historical"]);
   const DAILY_EXTENDED_PHASES = new Set(["daily-extended", "bg-daily-extended"]);
   const INCREMENTAL_COMPACT_PHASES = new Set(["incremental"]);
@@ -3123,6 +3235,17 @@
   /** Steady state : vitaux denses + sommeil compactés (1 pt/jour) — Watch très dense. */
   function isIncrementalCompactPhase(phaseLabel) {
     return INCREMENTAL_COMPACT_PHASES.has(String(phaseLabel ?? ""));
+  }
+
+  /**
+   * Pas/cal/FC repos via daily_aggregates HK (pas de samples |agg| figés) :
+   * incrémental, 7 j initiaux, catch-up.
+   */
+  function isActivityAggregatesOnlyPhase(phaseLabel) {
+    const label = String(phaseLabel ?? "");
+    if (INCREMENTAL_COMPACT_PHASES.has(label)) return true;
+    if (label === `priority-${PRIORITY_LOOKBACK_DAYS}d` || label === "catch-up") return true;
+    return false;
   }
 
   function useVitalCompactMode(phaseLabel) {
@@ -3445,6 +3568,7 @@
     const phaseLabel = options?.phase ?? "sync";
     const historicalLight = isHistoricalLightPhase(phaseLabel);
     const incrementalCompact = isIncrementalCompactPhase(phaseLabel);
+    const activityAggregatesOnly = isActivityAggregatesOnlyPhase(phaseLabel);
     const vitalCompact = useVitalCompactMode(phaseLabel);
     const sleepCompact = useSleepCompactMode(phaseLabel);
     const strictSlice = options?.strictSlice === true;
@@ -3475,11 +3599,12 @@
     const onlyTypes = options?.onlyTypes;
     const sleepOnlyRepair = Array.isArray(onlyTypes) && onlyTypes.length === 1 && onlyTypes[0] === "sleep";
     const vitalsOnlyRepair = Array.isArray(onlyTypes) && onlyTypes.length > 0 && !sleepOnlyRepair;
+    const skipHeavyExtras = vitalsOnlyRepair || sleepOnlyRepair;
 
     const [dailyAggsFetched, pluginVersion] = await Promise.all([
-      sleepOnlyRepair || vitalsOnlyRepair
-        ? Promise.resolve([])
-        : fetchDailyAggregatesFromHealthKit(Health, startIso, endIsoQuery, errors, grantedSet),
+      hasQueryAggregated
+        ? fetchDailyAggregatesFromHealthKit(Health, startIso, endIsoQuery, errors, grantedSet)
+        : Promise.resolve([]),
       (async () => {
         try {
           const v = await Health.getPluginVersion();
@@ -3592,7 +3717,9 @@
         const label = `${typeKey}${parts.length > 1 ? `#${i + 1}` : ""}`;
         const payload = payloadShell(baseShell, {
           samples_by_type: { [typeKey]: parts[i] },
-          daily_aggregates: onlyTypes ? [] : activityOverlayAggs,
+          // Overlay pas/cal HealthKit statistics — évite qu'un lot sommeil/vitaux seul
+          // ne recalcule steps_total depuis un vieux sample partiel (ex. 26 pas).
+          daily_aggregates: activityOverlayAggs,
           workouts: { items: [] },
         });
         const kb = Math.round(estimateJsonBytes(payload) / 1024);
@@ -3610,6 +3737,47 @@
         }
       }
       return lastRes;
+    }
+
+    if (sleepOnlyRepair && Array.isArray(options?.prefetchedSleepSamples)) {
+      const prefetched = options.prefetchedSleepSamples;
+      if (!prefetched.length) {
+        return {
+          ok: true,
+          skipped: true,
+          reason: "no_prefetched_sleep",
+          token: postQueue.getToken(),
+          sentSamples: 0,
+          sentWorkouts: 0,
+          sentAggregates: 0,
+          batched: true,
+          batch_count: 0,
+          streaming: true,
+        };
+      }
+      if (!readGranted.includes("sleep")) readGranted.push("sleep");
+      const block = {
+        data_type: "sleep",
+        unit_default: defaultUnit("sleep"),
+        sample_count: prefetched.length,
+        samples: prefetched,
+      };
+      log(`  POST sommeil stades ciblé (${prefetched.length} segment(s))…`);
+      const sleepPost = await postSampleBlock("sleep", block);
+      return {
+        ok: sleepPost.ok,
+        status: sleepPost.status,
+        error: sleepPost.error,
+        body: sleepPost.body,
+        token: postQueue.getToken(),
+        payload: { ...baseShell, sync_id: syncId },
+        sentSamples: prefetched.length,
+        sentWorkouts: 0,
+        sentAggregates: 0,
+        batched: true,
+        batch_count: postLots,
+        streaming: true,
+      };
     }
 
     const dailyExtendedOnly =
@@ -3841,7 +4009,7 @@
       };
     }
 
-    if (hasQueryAggregated && !onlyTypes) {
+    if (hasQueryAggregated && !onlyTypes && !activityAggregatesOnly) {
       const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw, vitalNightIndex);
       const scoringOrder = ["steps", "calories", "restingHeartRate"];
       for (const type of scoringOrder) {
@@ -3868,6 +4036,10 @@
           };
         }
       }
+    } else if (hasQueryAggregated && activityAggregatesOnly && !onlyTypes) {
+      log(
+        "  Pas/cal/FC repos : daily_aggregates + overlay HK seulement (mise à jour à chaque sync, sans sample |agg| figé)",
+      );
     }
 
     const typesToRead = SAMPLE_TYPES.filter(
@@ -4087,7 +4259,36 @@
       }
     }
 
-    if (vitalsOnlyRepair) {
+    if (skipHeavyExtras) {
+      if (vitalsOnlyRepair && options?.injectedSleepSamples?.length) {
+        const companions = options.injectedSleepSamples;
+        totalSamples += companions.length;
+        const block = {
+          data_type: "sleep",
+          unit_default: defaultUnit("sleep"),
+          sample_count: companions.length,
+          samples: companions,
+        };
+        samplesByType.sleep = block;
+        if (!readGranted.includes("sleep")) readGranted.push("sleep");
+        log(`  POST recovery companion sleep (${companions.length} segment(s))…`);
+        const sleepPost = await postSampleBlock("sleep", block);
+        if (!sleepPost.ok) {
+          return {
+            ok: false,
+            status: sleepPost.status,
+            error: sleepPost.error,
+            body: sleepPost.body,
+            token: postQueue.getToken(),
+            payload: { ...baseShell, sync_id: syncId },
+            sentSamples: totalSamples,
+            sentWorkouts: 0,
+            sentAggregates: 0,
+            batched: true,
+            batch_count: postLots,
+          };
+        }
+      }
       return {
         ok: true,
         status: 200,
@@ -4258,7 +4459,7 @@
         };
       }
       if (wRes.body) postBodies.push(wRes.body);
-    } else if (dailyAggregates.length > 0) {
+    } else if (dailyAggregates.length > 0 && !onlyTypes) {
       const payload = payloadShell(baseShell, {
         samples_by_type: {},
         daily_aggregates: dailyAggregates,
@@ -5013,6 +5214,111 @@
     return { ok: true, status: res.status, body, token: authToken, days };
   }
 
+  /**
+   * Après RECOMPUTE 90j (recovery) : réaligne pas/cal/FC repos sur Santé Apple via
+   * daily_aggregates — le recompute peut recalculer les totaux depuis vieux samples |agg|.
+   */
+  async function refreshRecentActivityAggregates(Health, token, options = {}) {
+    const quiet = !!options.quiet;
+    const lookbackDays = Number(options.days ?? PRIORITY_LOOKBACK_DAYS + 1);
+    if (!Health || typeof Health.queryAggregated !== "function") {
+      return { ok: false, skipped: true, reason: "no_query_aggregated", token };
+    }
+
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - daysToMs(lookbackDays));
+    const startIso = startDate.toISOString();
+    const endIso = endDate.toISOString();
+    const endIsoQuery = new Date(endDate.getTime() + 60 * 1000).toISOString();
+    const errors = {};
+    const readGranted = [];
+    const readDenied = [];
+
+    const authStatus = await Health.checkAuthorization(HEALTH_AUTH_PERMS);
+    const grantedSet = new Set(authStatus?.readAuthorized ?? []);
+    for (const spec of STATISTICS_DAILY_SPECS) {
+      if (grantedSet.has(spec.type)) readGranted.push(spec.type);
+      else readDenied.push(spec.type);
+    }
+
+    let dailyAggsRaw = await fetchDailyAggregatesFromHealthKit(
+      Health,
+      startIso,
+      endIsoQuery,
+      errors,
+      grantedSet,
+    );
+    dailyAggsRaw = await fillStepsGapsInDailyAggregates(
+      Health,
+      dailyAggsRaw,
+      startIso,
+      endIsoQuery,
+      grantedSet,
+    );
+    if (!dailyAggsRaw.length) {
+      return { ok: true, skipped: true, reason: "no_activity_aggs", token };
+    }
+
+    let pluginVersion = "unknown";
+    try {
+      const v = await Health.getPluginVersion();
+      pluginVersion = v?.version ?? "unknown";
+    } catch (_) {}
+
+    const baseShell = buildSyncBasePayload({
+      syncId: crypto.randomUUID(),
+      startIso,
+      endIso,
+      pluginVersion,
+      readGranted,
+      readDenied,
+      errors,
+      hasQueryAggregated: true,
+      strategy: "healthkit_activity_refresh_post_recompute",
+    });
+    const payload = payloadShell(baseShell, {
+      samples_by_type: {},
+      daily_aggregates: dailyAggsRaw,
+      workouts: { items: [] },
+    });
+
+    if (!quiet) {
+      log(
+        `  Rafraîchissement pas/cal post-recompute (${dailyAggsRaw.length} j depuis HK statistics)…`,
+      );
+    }
+    const res = await postHealthSyncWithRetry(token, payload, "activity-refresh", { quiet });
+    if (res?.ok) {
+      log(`[sync-session] ACTIVITY_REFRESH ok aggs=${dailyAggsRaw.length}`);
+    } else if (!quiet) {
+      log(
+        `[sync-session] ACTIVITY_REFRESH échec ${res?.status ?? 0} ${res?.error ?? res?.reason ?? "unknown"}`,
+      );
+    }
+    return res;
+  }
+
+  async function runRecomputeWithActivityRefresh(Health, token, options = {}) {
+    const recompute = await postHealthRecompute(token, options);
+    let activeToken = recompute?.token ?? token;
+    if (!recompute?.ok) return { recompute, token: activeToken };
+
+    if (Health) {
+      try {
+        const refresh = await refreshRecentActivityAggregates(Health, activeToken, {
+          quiet: options.quiet,
+          days: options.activityRefreshDays ?? PRIORITY_LOOKBACK_DAYS + 1,
+        });
+        activeToken = refresh?.token ?? activeToken;
+      } catch (refreshErr) {
+        log(
+          `Rafraîchissement activité post-recompute: ${formatSyncError(refreshErr, "activity-refresh")}`,
+        );
+      }
+    }
+    return { recompute, token: activeToken };
+  }
+
   function storeSyncSummary(detail) {
     try {
       sessionStorage.setItem(
@@ -5277,7 +5583,8 @@
    * Réparation ciblée j 8–90 : stades sommeil compacts (constance horaires / réparateur).
    * Ne relit pas les vitaux ni les workouts.
    */
-  async function runHistoricalSleepStagesRepair(Health, token) {
+  async function runHistoricalSleepStagesRepair(Health, token, options = {}) {
+    const missingWakeDays = options?.missingWakeDays;
     const endDate = new Date(Date.now() - daysToMs(PRIORITY_LOOKBACK_DAYS));
     const startDate = new Date(Date.now() - daysToMs(SAMPLE_INTRADAY_LOOKBACK_DAYS));
     if (startDate.getTime() >= endDate.getTime()) {
@@ -5291,6 +5598,47 @@
       return { ok: false, reason: "no_sleep_perm", token };
     }
 
+    if (Array.isArray(missingWakeDays) && missingWakeDays.length === 0) {
+      return { ok: true, skipped: true, reason: "no_gaps", token };
+    }
+
+    if (Array.isArray(missingWakeDays) && missingWakeDays.length > 0) {
+      let activeToken = token;
+      let sentSamples = 0;
+      const sorted = [...missingWakeDays].sort();
+      log(
+        `Réparation sommeil stades ciblée — ${sorted.length} nuit(s) sans stades (j 8–${SAMPLE_INTRADAY_LOOKBACK_DAYS})…`,
+      );
+      for (let i = 0; i < sorted.length; i += SLEEP_STAGES_GAP_BATCH_DAYS) {
+        const batchDays = sorted.slice(i, i + SLEEP_STAGES_GAP_BATCH_DAYS);
+        const window = wakeDaysToReadWindow(batchDays);
+        if (!window) continue;
+        const wakeDaySet = new Set(batchDays);
+        const sleepRead = await readAllSleepSamples(Health, window.startIso, window.endIso, {
+          light: true,
+        });
+        let samples = buildSleepCompactStagedSamplesFromRaw(sleepRead.raw ?? []);
+        samples = filterSleepSamplesForWakeDays(samples, wakeDaySet);
+        if (!samples.length) continue;
+        const result = await collectAndStreamPost(
+          Health,
+          new Date(window.startIso),
+          new Date(window.endIso),
+          activeToken,
+          {
+            phase: "historical",
+            onlyTypes: ["sleep"],
+            repairStrategy: "healthkit_sleep_stages_repair_gap",
+            prefetchedSleepSamples: samples,
+          },
+        );
+        activeToken = result.token ?? activeToken;
+        if (!result.ok) return { ...result, token: activeToken };
+        sentSamples += result.sentSamples ?? 0;
+      }
+      return { ok: true, sentSamples, token: activeToken };
+    }
+
     log(
       `Réparation sommeil stades ${SAMPLE_INTRADAY_LOOKBACK_DAYS - PRIORITY_LOOKBACK_DAYS}j (j 8–${SAMPLE_INTRADAY_LOOKBACK_DAYS}) — mode historicalLight…`,
     );
@@ -5299,6 +5647,68 @@
       onlyTypes: ["sleep"],
       repairStrategy: "healthkit_sleep_stages_repair",
     });
+  }
+
+  async function executeSleepStagesRepair(Health, token, coverage, options = {}) {
+    const attempts = parseInt(getSyncScopedItem(SLEEP_STAGES_REPAIR_ATTEMPTS_KEY, token) || "0", 10);
+    setSyncScopedItem(SLEEP_STAGES_REPAIR_ATTEMPTS_KEY, String(attempts + 1), token);
+
+    const missingWakeDays = coverage?.missingWakeDays;
+    const result = await runHistoricalSleepStagesRepair(Health, token, {
+      missingWakeDays: Array.isArray(missingWakeDays) ? missingWakeDays : undefined,
+    });
+
+    if (result.ok && (result.sentSamples ?? 0) > 0) {
+      setSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, String(Date.now()), token);
+      log(
+        `[sync-session] SLEEP_STAGES_REPAIR ok samples=${result.sentSamples ?? 0} aggs=${result.sentAggregates ?? 0}`,
+      );
+      window.setTimeout(() => {
+        if (window.PcpHealthDisplayRefresh?.scheduleRefreshAfterSync) {
+          window.PcpHealthDisplayRefresh.scheduleRefreshAfterSync({
+            reason: "sleep-stages-repair",
+            pulse: false,
+            retryMs: [800, 2000],
+          });
+        }
+      }, 150);
+      return { applied: true, ...result };
+    }
+    if (result.ok && result.skipped) {
+      setSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, String(Date.now()), token);
+      log("[sync-session] SLEEP_STAGES_REPAIR skip (pas de sommeil HealthKit sur les nuits ciblées)");
+      return { applied: false, ...result };
+    }
+
+    if (attempts + 1 >= SLEEP_STAGES_REPAIR_MAX_ATTEMPTS) {
+      setSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, String(Date.now()), token);
+      log(
+        `[sync-session] SLEEP_STAGES_REPAIR abandon après ${SLEEP_STAGES_REPAIR_MAX_ATTEMPTS} tentative(s)`,
+      );
+    }
+
+    log(
+      `[sync-session] SLEEP_STAGES_REPAIR échec ${result.error ?? result.reason ?? "unknown"}`,
+    );
+    return { applied: false, ...result };
+  }
+
+  function runBackgroundSleepStagesRepair(Health, token, coverage) {
+    if (__pcpSleepStagesRepairRunning) {
+      log("Réparation sommeil stades déjà en cours (arrière-plan)");
+      return;
+    }
+    __pcpSleepStagesRepairRunning = true;
+    log("[sync-session] SLEEP_STAGES_REPAIR background démarré");
+    void (async () => {
+      try {
+        await executeSleepStagesRepair(Health, token, coverage, { background: true });
+      } catch (err) {
+        log(`Réparation sommeil stades exception: ${formatSyncError(err, "sleep-stages-repair")}`);
+      } finally {
+        __pcpSleepStagesRepairRunning = false;
+      }
+    })();
   }
 
   async function maybeRepairHistoricalSleepStages(Health, token, options) {
@@ -5324,40 +5734,46 @@
         setSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, String(Date.now()), token);
       }
       log(
-        `Réparation sommeil stades: couverture OK (${coverage.stagedHistoricalNights ?? 0}/${coverage.historicalSleepNights ?? 0} nuits historiques)`,
+        `Réparation sommeil stades: couverture OK (${coverage.stagedHistoricalNights ?? 0}/${coverage.historicalSleepNights ?? 0} nuits j 8–${SAMPLE_INTRADAY_LOOKBACK_DAYS})`,
       );
       log("[sync-session] SLEEP_STAGES_REPAIR skip (rien à réparer)");
       return { applied: false, reason: "no_gaps", token };
+    }
+
+    const attempts = parseInt(getSyncScopedItem(SLEEP_STAGES_REPAIR_ATTEMPTS_KEY, token) || "0", 10);
+    if (attempts >= SLEEP_STAGES_REPAIR_MAX_ATTEMPTS) {
+      if (!getSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, token)) {
+        setSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, String(Date.now()), token);
+      }
+      log(
+        `[sync-session] SLEEP_STAGES_REPAIR skip (max ${SLEEP_STAGES_REPAIR_MAX_ATTEMPTS} tentative(s) — recovery non impacté)`,
+      );
+      return { applied: false, reason: "max_attempts", token };
     }
 
     if (getSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, token)) {
       log("Réparation sommeil stades: reprise (gap persistant malgré tentative précédente)");
     }
 
+    const gapNote =
+      coverage.missingWakeDayCount > 0
+        ? `, ${coverage.missingWakeDayCount} nuit(s) ciblée(s)`
+        : "";
     log(
-      `Réparation sommeil stades — ${coverage.stagedHistoricalNights ?? 0}/${coverage.historicalSleepNights ?? 0} nuit(s) avec stades sur j 8–${SAMPLE_INTRADAY_LOOKBACK_DAYS}`,
+      `Réparation sommeil stades — ${coverage.stagedHistoricalNights ?? 0}/${coverage.historicalSleepNights ?? 0} nuit(s) avec stades sur j 8–${SAMPLE_INTRADAY_LOOKBACK_DAYS}${gapNote}`,
     );
     log(
-      `[sync-session] SLEEP_STAGES_REPAIR début staged=${coverage.stagedHistoricalNights} sleep_nights=${coverage.historicalSleepNights}`,
+      `[sync-session] SLEEP_STAGES_REPAIR début staged=${coverage.stagedHistoricalNights} sleep_nights=${coverage.historicalSleepNights} missing=${coverage.missingWakeDayCount ?? 0}`,
     );
 
-    const result = await runHistoricalSleepStagesRepair(Health, token);
-    if (result.ok && (result.sentSamples ?? 0) > 0) {
-      setSyncScopedItem(SLEEP_STAGES_REPAIR_KEY, String(Date.now()), token);
-      log(
-        `[sync-session] SLEEP_STAGES_REPAIR ok samples=${result.sentSamples ?? 0} aggs=${result.sentAggregates ?? 0}`,
-      );
-      return { applied: true, ...result };
-    }
-    if (result.ok && result.skipped) {
-      log("[sync-session] SLEEP_STAGES_REPAIR skip (pas de sommeil HealthKit)");
-      return { applied: false, ...result };
+    if (options?.foregroundSleepStagesRepair || options?.manual) {
+      return executeSleepStagesRepair(Health, token, coverage, options);
     }
 
-    log(
-      `[sync-session] SLEEP_STAGES_REPAIR échec ${result.error ?? result.reason ?? "unknown"}`,
-    );
-    return { applied: false, ...result };
+    log("Réparation sommeil stades planifiée en arrière-plan (sync récente non bloquée)");
+    log("[sync-session] SLEEP_STAGES_REPAIR background scheduled");
+    runBackgroundSleepStagesRepair(Health, token, coverage);
+    return { applied: false, scheduled: true, token };
   }
 
   /** Re-sync j 91–365 pour comptes déjà backfillés sans sommeil/workouts historiques. */
@@ -5494,7 +5910,7 @@
     const fromDay = slices[slices.length - 1].startDate.toISOString().slice(0, 10);
     const toDay = slices[0].endDate.toISOString().slice(0, 10);
     log(
-      `Réparation recovery — re-envoi vitaux nuit j ${PRIORITY_LOOKBACK_DAYS + 1}–${SAMPLE_INTRADAY_LOOKBACK_DAYS} (${fromDay} → ${toDay}, ${slices.length} tranche(s))…`,
+      `Réparation recovery — vitaux nuit + sommeil compagnon j ${PRIORITY_LOOKBACK_DAYS + 1}–${SAMPLE_INTRADAY_LOOKBACK_DAYS} (${fromDay} → ${toDay}, ${slices.length} tranche(s))…`,
     );
     log("[sync-session] RECOVERY_RESCORE_REPAIR début");
 
@@ -5511,6 +5927,10 @@
       log(
         `Réparation recovery tranche ${i + 1}/${slices.length} (${slice.startDate.toISOString().slice(0, 10)} → ${slice.endDate.toISOString().slice(0, 10)})…`,
       );
+      const companions = await buildRecoveryCompanionSleepForSlice(Health, slice, repairTypes);
+      if (companions.length > 0) {
+        log(`  Sommeil compagnon: ${companions.length} segment(s) pour attribution nocturne`);
+      }
       const result = await collectAndStreamPost(
         Health,
         slice.startDate,
@@ -5521,6 +5941,7 @@
           phase: "historical",
           onlyTypes: repairTypes,
           repairStrategy: "healthkit_recovery_rescore_repair",
+          injectedSleepSamples: companions,
         },
       );
       activeToken = result.token ?? activeToken;
@@ -5581,16 +6002,16 @@
               );
             }
             try {
-              const recompute = await postHealthRecompute(activeToken, {
+              const recompute = await runRecomputeWithActivityRefresh(Health, activeToken, {
                 authToken: activeToken,
                 quiet: true,
               });
               activeToken = recompute?.token ?? activeToken;
-              if (recompute?.ok) {
-                log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+              if (recompute?.recompute?.ok) {
+                log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
               } else {
                 log(
-                  `[sync-session] RECOMPUTE_SCORES échec ${recompute?.status ?? 0} ${recompute?.error ?? recompute?.reason ?? "unknown"}`,
+                  `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
                 );
               }
             } catch (recomputeErr) {
@@ -5670,16 +6091,16 @@
             );
           }
           try {
-            const recompute = await postHealthRecompute(activeToken, {
+            const recompute = await runRecomputeWithActivityRefresh(Health, activeToken, {
               authToken: activeToken,
               quiet: true,
             });
             activeToken = recompute?.token ?? activeToken;
-            if (recompute?.ok) {
-              log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+            if (recompute?.recompute?.ok) {
+              log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
             } else {
               log(
-                `[sync-session] RECOMPUTE_SCORES échec ${recompute?.status ?? 0} ${recompute?.error ?? recompute?.reason ?? "unknown"}`,
+                `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
               );
             }
           } catch (recomputeErr) {
@@ -5835,9 +6256,11 @@
 
       const syncStartedAt = Date.now();
       let activeToken = token;
+      let forceRecomputeAfterSync = !!options?.forceRecompute;
       try {
         const stepsRepair = await maybeRepairHistoricalSteps(Health, activeToken, options);
         activeToken = stepsRepair?.token ?? activeToken;
+        if (stepsRepair?.applied) forceRecomputeAfterSync = true;
       } catch (repairErr) {
         log(`Réparation pas exception: ${formatSyncError(repairErr, "steps-repair")}`);
       }
@@ -5850,6 +6273,7 @@
       try {
         const dailyRepair = await maybeRepairDailyExtendedSleepWorkouts(Health, activeToken, options);
         activeToken = dailyRepair?.token ?? activeToken;
+        if (dailyRepair?.applied) forceRecomputeAfterSync = true;
       } catch (dailyRepairErr) {
         log(
           `Réparation agrégats 1 an exception: ${formatSyncError(dailyRepairErr, "daily-extended-repair")}`,
@@ -5858,6 +6282,7 @@
       try {
         const scoringRepair = await maybeRepairScoring90dIntraday(Health, activeToken, options);
         activeToken = scoringRepair?.token ?? activeToken;
+        if (scoringRepair?.applied) forceRecomputeAfterSync = true;
       } catch (scoringRepairErr) {
         log(
           `Réparation intraday scoring 90j exception: ${formatSyncError(scoringRepairErr, "scoring-90d-repair")}`,
@@ -5866,6 +6291,7 @@
       try {
         const recoveryRepair = await maybeRepairRecoveryRescore(Health, activeToken, options);
         activeToken = recoveryRepair?.token ?? activeToken;
+        if (recoveryRepair?.applied) forceRecomputeAfterSync = true;
       } catch (recoveryRepairErr) {
         log(
           `Réparation recovery exception: ${formatSyncError(recoveryRepairErr, "recovery-rescore-repair")}`,
@@ -6004,22 +6430,35 @@
         setHistoricalBackfillPending(activeToken || token, false);
       }
       if (!backfillPending) {
-        try {
-          const recompute = await postHealthRecompute(activeToken || token, {
-            authToken: activeToken || token,
-            quiet: true,
-            days: options?.recomputeDays,
-          });
-          activeToken = recompute?.token ?? activeToken;
-          if (recompute?.ok) {
-            log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
-          } else {
-            log(
-              `[sync-session] RECOMPUTE_SCORES échec ${recompute?.status ?? 0} ${recompute?.error ?? recompute?.reason ?? "unknown"}`,
-            );
+        const samplesInserted = Number(merged?.body?.samples_inserted ?? body?.samples_inserted ?? 0);
+        const incrementalOnly =
+          syncPlan.mode === "incremental" &&
+          activePhases.length > 0 &&
+          activePhases.every((p) => p.label === "incremental");
+        const shouldRecompute =
+          forceRecomputeAfterSync || (!incrementalOnly && samplesInserted > 0);
+        if (shouldRecompute) {
+          try {
+            const recompute = await runRecomputeWithActivityRefresh(Health, activeToken || token, {
+              authToken: activeToken || token,
+              quiet: true,
+              days: options?.recomputeDays,
+            });
+            activeToken = recompute?.token ?? activeToken;
+            if (recompute?.recompute?.ok) {
+              log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+            } else {
+              log(
+                `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
+              );
+            }
+          } catch (recomputeErr) {
+            log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
           }
-        } catch (recomputeErr) {
-          log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
+        } else {
+          log(
+            `[sync-session] RECOMPUTE_SCORES skip (${incrementalOnly ? "incremental — rollup par lot" : "0 sample inséré"})`,
+          );
         }
       }
       logSyncPostResponse(body);
@@ -6110,6 +6549,7 @@
     HISTORICAL_CHECKPOINT_KEY,
     STEPS_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
+    SLEEP_STAGES_REPAIR_ATTEMPTS_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
     SCORING_90D_REPAIR_KEY,
     RECOVERY_RESCORE_REPAIR_KEY,

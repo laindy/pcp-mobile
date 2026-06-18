@@ -183,6 +183,55 @@ object HistoricalLightCompactor {
         return best.mapValues { it.value.second }
     }
 
+    fun vitalWakeDayFromInstant(instant: Instant, zone: ZoneId): LocalDate =
+        vitalWakeDay(instant, zone)
+
+    /**
+     * 1 segment sommeil par jour de réveil des vitaux réparés — attribution nocturne backend.
+     */
+    fun buildCompanionSleepForWakeDays(
+        wakeDays: Set<LocalDate>,
+        sleepRaw: List<SamplePoint>,
+        zone: ZoneId,
+    ): List<SamplePoint> {
+        val staged = compactSleepStagedHistorical(sleepRaw, zone)
+        val bestByWake = mutableMapOf<LocalDate, SamplePoint>()
+        for (s in staged) {
+            if (isNonSleepStageForVitalIndex(s.stage)) continue
+            if (!s.endAt.isAfter(s.startAt)) continue
+            val wakeDay = instantToLocalDate(s.endAt, zone)
+            val dur = s.endAt.epochSecond - s.startAt.epochSecond
+            val prev = bestByWake[wakeDay]
+            if (prev == null || dur > (prev.endAt.epochSecond - prev.startAt.epochSecond)) {
+                bestByWake[wakeDay] = s
+            }
+        }
+
+        val out = mutableListOf<SamplePoint>()
+        for (wakeDay in wakeDays) {
+            val existing = bestByWake[wakeDay]
+            if (existing != null) {
+                out += existing
+                continue
+            }
+            val startAt = wakeDay.minusDays(1).atTime(22, 0).toInstant(ZoneOffset.UTC)
+            val endAt = wakeDay.atTime(10, 0).toInstant(ZoneOffset.UTC)
+            val mins = (endAt.epochSecond - startAt.epochSecond) / 60.0
+            if (mins <= 0) continue
+            out += SamplePoint(
+                dataType = "sleep",
+                value = mins,
+                unit = "minute",
+                startAt = startAt,
+                endAt = endAt,
+                sourceName = "healthkit",
+                platformId = "sleep|companion|$wakeDay".take(255),
+                stage = "asleep",
+            )
+        }
+        return out
+    }
+
     /** Historique : fusion par stade/nuit avec horaires réels (REM+Deep pour scoring). */
     private fun compactSleepStagedHistorical(
         samples: List<SamplePoint>,

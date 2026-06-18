@@ -23,8 +23,11 @@ object ServerBackfillProbe {
     private const val MIN_HISTORICAL_STAGED_NIGHTS = 20
     private const val MIN_HISTORICAL_SLEEP_NIGHTS_TO_REQUIRE = 10
     private const val PRIORITY_LOOKBACK_DAYS = 7L
+    private const val SAMPLE_INTRADAY_LOOKBACK_DAYS = 90L
+    private const val SLEEP_SAMPLES_PROBE_MAX_PAGES = 16
     private const val OLDEST_SLACK_DAYS = 14L
     private val SYNTHETIC_SLEEP_PLATFORM_RE = Regex("^sleep\\|agg\\|", RegexOption.IGNORE_CASE)
+    private val HIST_COMPACT_SLEEP_PLATFORM_RE = Regex("^sleep\\|hist\\|", RegexOption.IGNORE_CASE)
     private val DAY_FMT: DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_DATE
 
     data class Result(
@@ -48,17 +51,19 @@ object ServerBackfillProbe {
         val needsRepair: Boolean,
         val historicalSleepNights: Int,
         val stagedNights: Int,
+        val missingWakeDays: List<String> = emptyList(),
     )
 
     @JvmStatic
     fun probeSleepStagesGaps(store: TokenStore, http: OkHttpClient): SleepStagesGaps {
         val probe = probeServerHistoricalCoverage(store, http)
-        val dayFrom = LocalDate.now().minusDays(FULL_LOOKBACK_DAYS)
+        val dayFrom = LocalDate.now().minusDays(SAMPLE_INTRADAY_LOOKBACK_DAYS)
         val sleepProbe = probeSleepStagesCoverage(store, http, probe.rows, dayFrom)
         return SleepStagesGaps(
             needsRepair = sleepProbe.needsRepair,
             historicalSleepNights = sleepProbe.historicalSleepNights,
             stagedNights = sleepProbe.stagedNights,
+            missingWakeDays = sleepProbe.missingWakeDays,
         )
     }
 
@@ -99,7 +104,7 @@ object ServerBackfillProbe {
             )
         }
 
-        val dayFrom = LocalDate.now().minusDays(FULL_LOOKBACK_DAYS)
+        val dayFrom = LocalDate.now().minusDays(SAMPLE_INTRADAY_LOOKBACK_DAYS)
         val sleepProbe = probeSleepStagesCoverage(store, http, probe.rows, dayFrom)
         if (sleepProbe.needsRepair) {
             Log.i(
@@ -369,7 +374,11 @@ object ServerBackfillProbe {
         val needsRepair: Boolean,
         val historicalSleepNights: Int,
         val stagedNights: Int,
+        val missingWakeDays: List<String> = emptyList(),
     )
+
+    private fun historicalStagesDayFrom(): LocalDate =
+        LocalDate.now().minusDays(SAMPLE_INTRADAY_LOOKBACK_DAYS)
 
     private fun historicalCutoffDay(): LocalDate = LocalDate.now().minusDays(PRIORITY_LOOKBACK_DAYS)
 
@@ -383,11 +392,25 @@ object ServerBackfillProbe {
         return stage.isBlank() || stage == "night"
     }
 
+    private fun sleepSampleStage(item: JSONObject): String {
+        val extraStage = item.optJSONObject("extra")?.optString("stage", "")?.trim().orEmpty()
+        if (extraStage.isNotEmpty()) return extraStage
+        return item.optString("stage", "").trim()
+    }
+
+    private fun isHistCompactStagedSleepSample(item: JSONObject): Boolean {
+        val pid = item.optString("platform_id", "")
+        if (!HIST_COMPACT_SLEEP_PLATFORM_RE.containsMatchIn(pid)) return false
+        val stage = sleepSampleStage(item)
+        return stage.isNotEmpty() && stage != "night"
+    }
+
     private fun isRealStagedSleepSample(item: JSONObject): Boolean {
         if (item.optString("data_type", "") != "sleep") return false
         if (isSyntheticSleepSample(item)) return false
-        val stage = item.optJSONObject("extra")?.optString("stage", "")?.trim().orEmpty()
-        return stage.isNotEmpty()
+        if (isHistCompactStagedSleepSample(item)) return true
+        val stage = sleepSampleStage(item)
+        return stage.isNotEmpty() && stage != "night"
     }
 
     private fun wakeDayFromSample(item: JSONObject): LocalDate? {
@@ -422,13 +445,15 @@ object ServerBackfillProbe {
         base: String,
         token: String,
         dayFrom: LocalDate,
-        maxPages: Int = 4,
+        dayTo: LocalDate,
+        maxPages: Int = SLEEP_SAMPLES_PROBE_MAX_PAGES,
     ): JSONArray {
         val merged = JSONArray()
         val dateFrom = "${dayFrom.format(DAY_FMT)}T00:00:00.000Z"
+        val dateTo = "${dayTo.format(DAY_FMT)}T23:59:59.999Z"
         for (page in 1..maxPages) {
             val url =
-                "$base/api/v1/patients/me/health/samples?data_type=sleep&date_from=$dateFrom&page=$page&page_size=500&sort_order=desc"
+                "$base/api/v1/patients/me/health/samples?data_type=sleep&date_from=$dateFrom&date_to=$dateTo&page=$page&page_size=500&sort_order=desc"
             val request = Request.Builder()
                 .url(url)
                 .header("Authorization", "Bearer $token")
@@ -466,13 +491,34 @@ object ServerBackfillProbe {
             .readTimeout(12, TimeUnit.SECONDS)
             .build()
         val samples = try {
-            fetchSleepSamples(client, store.getApiBase().trimEnd('/'), token, dayFrom)
+            fetchSleepSamples(
+                client,
+                store.getApiBase().trimEnd('/'),
+                token,
+                dayFrom,
+                cutoff.minusDays(1),
+            )
         } catch (e: Exception) {
             Log.w(TAG, "Probe sommeil stades: ${e.message}")
             return SleepStagesProbe(needsRepair = false, historicalSleepNights = historicalSleepNights, stagedNights = 0)
         }
 
         val staged = mutableSetOf<String>()
+        val nightsWithSleep = mutableListOf<String>()
+        for (i in 0 until rows.length()) {
+            val row = rows.optJSONObject(i) ?: continue
+            val dayStr = row.optString("day", "")
+            if (dayStr.isBlank()) continue
+            val day = try {
+                LocalDate.parse(dayStr, DAY_FMT)
+            } catch (_: Exception) {
+                continue
+            }
+            if (!isHistoricalDay(day, dayFrom, cutoff)) continue
+            if (row.optInt("sleep_total_min", 0) > 0) nightsWithSleep += dayStr
+        }
+        nightsWithSleep.sort()
+
         for (i in 0 until samples.length()) {
             val item = samples.optJSONObject(i) ?: continue
             val wake = wakeDayFromSample(item) ?: continue
@@ -482,6 +528,7 @@ object ServerBackfillProbe {
             }
         }
         val stagedCount = staged.size
+        val missingWakeDays = nightsWithSleep.filter { !staged.contains(it) }
         val needsRepair =
             historicalSleepNights >= MIN_HISTORICAL_SLEEP_NIGHTS_TO_REQUIRE &&
                 stagedCount < MIN_HISTORICAL_STAGED_NIGHTS &&
@@ -490,6 +537,7 @@ object ServerBackfillProbe {
             needsRepair = needsRepair,
             historicalSleepNights = historicalSleepNights,
             stagedNights = stagedCount,
+            missingWakeDays = missingWakeDays,
         )
     }
 }

@@ -229,6 +229,18 @@ class TokenStore(private val context: Context) {
         )
     }
 
+    fun getSleepStagesRepairAttempts(patientId: String): Int =
+        HealthSyncStateStore.getLong(app, patientId, HealthSyncStateStore.KEY_SLEEP_STAGES_REPAIR_ATTEMPTS).toInt()
+
+    fun setSleepStagesRepairAttempts(patientId: String, attempts: Int) {
+        HealthSyncStateStore.setField(
+            app,
+            patientId,
+            HealthSyncStateStore.KEY_SLEEP_STAGES_REPAIR_ATTEMPTS,
+            attempts.toString(),
+        )
+    }
+
     fun getRecoveryRescoreRepairAt(patientId: String): Long =
         HealthSyncStateStore.getLong(app, patientId, HealthSyncStateStore.KEY_RECOVERY_RESCORE_REPAIR)
 

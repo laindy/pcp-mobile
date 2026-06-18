@@ -17,9 +17,10 @@ object HealthSyncStateStore {
     const val KEY_AGGREGATES_BACKFILL = "pcpHealthAggregatesV8"
     const val KEY_VITALS_DAILY_REPAIR = "pcpHealthVitalsDailyRepairV1"
     const val KEY_SLEEP_DAILY_REPAIR = "pcpHealthSleepDailyRepairV2"
-    const val KEY_SLEEP_STAGES_REPAIR = "pcpHealthSleepStagesRepairV1"
+    const val KEY_SLEEP_STAGES_REPAIR = "pcpHealthSleepStagesRepairV2"
+    const val KEY_SLEEP_STAGES_REPAIR_ATTEMPTS = "pcpHealthSleepStagesRepairAttemptsV2"
     const val KEY_DAILY_EXTENDED_CHECKPOINT = "pcpHealthDailyExtendedCheckpoint"
-    const val KEY_RECOVERY_RESCORE_REPAIR = "pcpHealthRecoveryRescoreRepairV3"
+    const val KEY_RECOVERY_RESCORE_REPAIR = "pcpHealthRecoveryRescoreRepairV4"
 
     private const val PREFS = "pcp_health_sync_state_by_patient"
     private const val KEY_PREFIX = "pcp_health_sync_state_"
