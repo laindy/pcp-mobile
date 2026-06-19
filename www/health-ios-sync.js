@@ -3238,8 +3238,8 @@
   }
 
   /**
-   * Pas/cal/FC repos via daily_aggregates HK (pas de samples |agg| figés) :
-   * incrémental, 7 j initiaux, catch-up.
+   * Pas/cal/FC repos : totaux via daily_aggregates + samples |agg| scoring (upsert backend).
+   * Phases : incrémental, 7 j initiaux, catch-up.
    */
   function isActivityAggregatesOnlyPhase(phaseLabel) {
     const label = String(phaseLabel ?? "");
@@ -4009,7 +4009,7 @@
       };
     }
 
-    if (hasQueryAggregated && !onlyTypes && !activityAggregatesOnly) {
+    if (hasQueryAggregated && !onlyTypes) {
       const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw, vitalNightIndex);
       const scoringOrder = ["steps", "calories", "restingHeartRate"];
       for (const type of scoringOrder) {
@@ -4036,10 +4036,11 @@
           };
         }
       }
-    } else if (hasQueryAggregated && activityAggregatesOnly && !onlyTypes) {
-      log(
-        "  Pas/cal/FC repos : daily_aggregates + overlay HK seulement (mise à jour à chaque sync, sans sample |agg| figé)",
-      );
+      if (activityAggregatesOnly) {
+        log(
+          "  Pas/cal/FC repos : daily_aggregates + samples |agg| scoring (upsert backend)",
+        );
+      }
     }
 
     const typesToRead = SAMPLE_TYPES.filter(

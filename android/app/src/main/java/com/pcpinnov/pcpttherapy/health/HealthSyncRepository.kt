@@ -84,7 +84,7 @@ class HealthSyncRepository(private val context: Context) {
                     endAt = noon,
                     sourceId = "health_connect",
                     sourceName = "health_connect",
-                    platformId = "steps|agg|${row.day}|$steps".take(255),
+                    platformId = "steps|agg|${row.day}",
                 ),
             )
         }
@@ -496,7 +496,7 @@ class HealthSyncRepository(private val context: Context) {
                     endAt = noon,
                     sourceId = "health_connect",
                     sourceName = "health_connect",
-                    platformId = "calories|agg|${row.day}|$kcal".take(255),
+                    platformId = "calories|agg|${row.day}",
                 ),
             )
         }
@@ -807,7 +807,7 @@ class HealthSyncRepository(private val context: Context) {
                         endAt = noon,
                         sourceId = "health_connect",
                         sourceName = "health_connect",
-                        platformId = "steps|agg|${row.day}|$steps".take(255),
+                        platformId = "steps|agg|${row.day}",
                     ),
                 )
             }
@@ -824,7 +824,7 @@ class HealthSyncRepository(private val context: Context) {
                         endAt = noon,
                         sourceId = "health_connect",
                         sourceName = "health_connect",
-                        platformId = "calories|agg|${row.day}|$kcal".take(255),
+                        platformId = "calories|agg|${row.day}",
                     ),
                 )
             }
