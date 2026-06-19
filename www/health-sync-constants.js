@@ -14,6 +14,8 @@
   /** Ancienne fenêtre intraday — gap j 61–90 pour réparation 1× après migration. */
   var PREVIOUS_INTRADAY_LOOKBACK_DAYS = 60;
   var PRIORITY_LOOKBACK_DAYS = 7;
+  /** Fenêtre repair pas/cal/effort récents (7 j UI + marge). */
+  var RECENT_ACTIVITY_REPAIR_DAYS = PRIORITY_LOOKBACK_DAYS + 7;
   var WORKOUT_LOOKBACK_DAYS = 365;
 
   /** Probe serveur — couverture agrégats journaliers sur 1 an. */
@@ -30,6 +32,7 @@
     SAMPLE_INTRADAY_LOOKBACK_DAYS: SAMPLE_INTRADAY_LOOKBACK_DAYS,
     PREVIOUS_INTRADAY_LOOKBACK_DAYS: PREVIOUS_INTRADAY_LOOKBACK_DAYS,
     PRIORITY_LOOKBACK_DAYS: PRIORITY_LOOKBACK_DAYS,
+    RECENT_ACTIVITY_REPAIR_DAYS: RECENT_ACTIVITY_REPAIR_DAYS,
     WORKOUT_LOOKBACK_DAYS: WORKOUT_LOOKBACK_DAYS,
     /** Alias probe / logs « backfill journalier ». */
     FULL_LOOKBACK_DAYS: DAILY_AGGREGATE_LOOKBACK_DAYS,

@@ -13,6 +13,7 @@
   const MS_PER_DAY = 24 * 60 * 60 * 1000;
   /** Fenêtre récente (stades complets) — aligné health-ios-sync.js */
   const PRIORITY_LOOKBACK_DAYS = SYNC_CONST.PRIORITY_LOOKBACK_DAYS ?? 7;
+  const RECENT_ACTIVITY_REPAIR_DAYS = SYNC_CONST.RECENT_ACTIVITY_REPAIR_DAYS ?? PRIORITY_LOOKBACK_DAYS + 7;
   const SAMPLE_INTRADAY_LOOKBACK_DAYS = SYNC_CONST.SAMPLE_INTRADAY_LOOKBACK_DAYS ?? 90;
   /** Nuits avec stades réels requises sur j 8–{intraday} (constance / réparateur). */
   const MIN_HISTORICAL_STAGED_NIGHTS = 20;
@@ -54,6 +55,56 @@
     if (row.calories_total_kcal != null && Number(row.calories_total_kcal) > 0) return true;
     if (row.resting_heart_rate_avg != null && Number(row.resting_heart_rate_avg) > 0) return true;
     return false;
+  }
+
+  function recentActivityRepairCutoffDayStr() {
+    const d = new Date(Date.now() - RECENT_ACTIVITY_REPAIR_DAYS * MS_PER_DAY);
+    return formatDateOnly(d);
+  }
+
+  function isRecentActivityRepairDay(dayStr) {
+    if (!dayStr) return false;
+    return dayStr >= recentActivityRepairCutoffDayStr();
+  }
+
+  /** Jour récent avec activité mais sans calories_total_kcal (énergie UI + fallback effort). */
+  function dayRowMissingCalories(row) {
+    if (!row?.day || !isRecentActivityRepairDay(row.day)) return false;
+    const cal = Number(row.calories_total_kcal);
+    if (Number.isFinite(cal) && cal > 0) return false;
+    if (Number(row.steps_total) > 0) return true;
+    if (Number(row.sleep_total_min) > 0) return true;
+    if (Number(row.hrv_avg_ms) > 0) return true;
+    if (Number(row.resting_heart_rate_avg) > 0) return true;
+    if (Number(row.respiratory_rate_avg) > 0) return true;
+    if (Number(row.oxygen_saturation_avg) > 0) return true;
+    return false;
+  }
+
+  /** Jour récent avec kcal agrégées mais effort_score absent (sample calories scoring manquant). */
+  function dayRowMissingEffortDespiteCalories(row) {
+    if (!row?.day || !isRecentActivityRepairDay(row.day)) return false;
+    const cal = Number(row.calories_total_kcal);
+    if (!Number.isFinite(cal) || cal <= 0) return false;
+    const effort = row.effort_score;
+    return effort == null || effort === "";
+  }
+
+  function evaluateActivityCaloriesGaps(rows) {
+    const missingDays = new Set();
+    if (!Array.isArray(rows)) {
+      return { missingCount: 0, missingDays: [], rowCount: 0, repairWindowDays: RECENT_ACTIVITY_REPAIR_DAYS };
+    }
+    for (const row of rows) {
+      if (dayRowMissingCalories(row)) missingDays.add(row.day);
+      if (dayRowMissingEffortDespiteCalories(row)) missingDays.add(row.day);
+    }
+    return {
+      missingCount: missingDays.size,
+      missingDays: [...missingDays].sort(),
+      rowCount: rows.length,
+      repairWindowDays: RECENT_ACTIVITY_REPAIR_DAYS,
+    };
   }
 
   /** Jour avec signal vitaux/sommeil/calories mais steps_total absent (bug sync compact). */
@@ -196,6 +247,12 @@
   async function probeServerStepsGaps(token, options) {
     const probe = await probeServerHistoricalCoverage(token, options);
     const gaps = evaluateStepsGaps(probe.rows);
+    return { ...gaps, dayFrom: probe.dayFrom, sufficient: probe.sufficient };
+  }
+
+  async function probeServerActivityCaloriesGaps(token, options) {
+    const probe = await probeServerHistoricalCoverage(token, options);
+    const gaps = evaluateActivityCaloriesGaps(probe.rows);
     return { ...gaps, dayFrom: probe.dayFrom, sufficient: probe.sufficient };
   }
 
@@ -522,10 +579,15 @@
     MIN_SPAN_DAYS,
     dailyRowHasSignal,
     dayRowMissingSteps,
+    dayRowMissingCalories,
+    dayRowMissingEffortDespiteCalories,
     evaluateCoverage,
     evaluateStepsGaps,
+    evaluateActivityCaloriesGaps,
     probeServerHistoricalCoverage,
     probeServerStepsGaps,
+    probeServerActivityCaloriesGaps,
+    RECENT_ACTIVITY_REPAIR_DAYS,
     probeServerSleepStagesCoverage,
     evaluateSleepStagesCoverage,
     isRealStagedSleepSample,

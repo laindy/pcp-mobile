@@ -193,6 +193,18 @@ class TokenStore(private val context: Context) {
         )
     }
 
+    fun getActivityCaloriesRepairAt(patientId: String): Long =
+        HealthSyncStateStore.getLong(app, patientId, HealthSyncStateStore.KEY_ACTIVITY_CALORIES_REPAIR)
+
+    fun setActivityCaloriesRepairAt(patientId: String, epochMillis: Long) {
+        HealthSyncStateStore.setField(
+            app,
+            patientId,
+            HealthSyncStateStore.KEY_ACTIVITY_CALORIES_REPAIR,
+            epochMillis.toString(),
+        )
+    }
+
     fun getVitalsResyncAt(patientId: String?): Long =
         HealthSyncStateStore.getLong(app, patientId, HealthSyncStateStore.KEY_VITALS_DAILY_REPAIR)
 
@@ -478,6 +490,7 @@ class TokenStore(private val context: Context) {
         /** Alias probe / agrégats journaliers. */
         const val FULL_LOOKBACK_MS: Long = DAILY_AGGREGATE_LOOKBACK_MS
         const val PRIORITY_LOOKBACK_MS: Long = 7L * 24 * 60 * 60 * 1000
+        const val RECENT_ACTIVITY_REPAIR_MS: Long = 14L * 24 * 60 * 60 * 1000
         const val INCREMENTAL_LOOKBACK_MS: Long = 48L * 60 * 60 * 1000
         const val INCREMENTAL_OVERLAP_MS: Long = 24L * 60 * 60 * 1000
 

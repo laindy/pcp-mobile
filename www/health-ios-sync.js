@@ -22,6 +22,7 @@
   const WORKOUT_LOOKBACK_DAYS = SYNC_CONST.WORKOUT_LOOKBACK_DAYS ?? DAILY_AGGREGATE_LOOKBACK_DAYS;
   /** 1ère sync : fenêtre prioritaire pour débloquer l'UI vite. */
   const PRIORITY_LOOKBACK_DAYS = SYNC_CONST.PRIORITY_LOOKBACK_DAYS ?? 7;
+  const RECENT_ACTIVITY_REPAIR_DAYS = SYNC_CONST.RECENT_ACTIVITY_REPAIR_DAYS ?? PRIORITY_LOOKBACK_DAYS + 7;
   /** Syncs suivantes : delta court + recouvrement Apple Santé. */
   const INCREMENTAL_LOOKBACK_HOURS = 48;
   const INCREMENTAL_OVERLAP_HOURS = 24;
@@ -80,6 +81,8 @@
   const AGGREGATES_BACKFILL_KEY = "pcpHealthAggregatesV8";
   /** Réparation 1× des steps_total effacés après backfill compact (post-fix scoring steps). */
   const STEPS_REPAIR_KEY = "pcpHealthStepsRepairV2";
+  /** Réparation 1× énergie/effort récents — kcal agrégats + samples |agg| (14 j). */
+  const ACTIVITY_CALORIES_REPAIR_KEY = "pcpHealthActivityCaloriesRepairV1";
   /** Réparation 1× des stades sommeil historiques (j 8–90) pour constance / réparateur. */
   const SLEEP_STAGES_REPAIR_KEY = "pcpHealthSleepStagesRepairV2";
   const SLEEP_STAGES_REPAIR_ATTEMPTS_KEY = "pcpHealthSleepStagesRepairAttemptsV2";
@@ -105,6 +108,7 @@
     DAILY_EXTENDED_CHECKPOINT_KEY,
     AGGREGATES_BACKFILL_KEY,
     STEPS_REPAIR_KEY,
+    ACTIVITY_CALORIES_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_ATTEMPTS_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
@@ -115,6 +119,7 @@
     FULL_BACKFILL_KEY,
     LAST_DATA_SYNC_KEY,
     STEPS_REPAIR_KEY,
+    ACTIVITY_CALORIES_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_ATTEMPTS_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,
@@ -3560,6 +3565,46 @@
   }
 
   /**
+   * POST samples scoring pas/cal/FC repos depuis agrégats HealthKit statistics
+   * (+ overlay daily_aggregates pour ne pas effacer les totaux).
+   */
+  async function postActivityScoringBlocksFromDaily({
+    token,
+    baseShell,
+    dailyAggsRaw,
+    nightIndex,
+    postQueue: existingQueue,
+    logPrefix = "",
+  }) {
+    const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw, nightIndex);
+    const overlay = activityOverlayDailyAggregates(dailyAggsRaw);
+    const postQueue = existingQueue ?? createPostQueue(token);
+    let sentSamples = 0;
+    let postLots = 0;
+    const prefix = logPrefix ? `${logPrefix} ` : "";
+    for (const type of ["steps", "calories", "restingHeartRate"]) {
+      const block = scoringBlocks[type];
+      if (!block?.samples?.length) continue;
+      const payload = payloadShell(baseShell, {
+        samples_by_type: { [type]: block },
+        daily_aggregates: overlay,
+        workouts: { items: [] },
+      });
+      const kb = Math.round(estimateJsonBytes(payload) / 1024);
+      log(
+        `  POST ${prefix}scoring ${type} (${block.samples.length} jour(s), ~${kb}KB)…`,
+      );
+      const res = await postQueue.push(`${prefix}${type}`.trim(), payload);
+      postLots += 1;
+      if (!res.ok) {
+        return { ok: false, ...res, token: postQueue.getToken(), sentSamples, postLots };
+      }
+      sentSamples += block.samples.length;
+    }
+    return { ok: true, token: postQueue.getToken(), sentSamples, postLots };
+  }
+
+  /**
    * Lit HealthKit et POST chaque type dès qu'il est prêt (pipeline).
    * Le testeur voit les 1ères données en ~30s au lieu d'attendre la fin des 60j.
    */
@@ -5289,14 +5334,38 @@
       );
     }
     const res = await postHealthSyncWithRetry(token, payload, "activity-refresh", { quiet });
-    if (res?.ok) {
-      log(`[sync-session] ACTIVITY_REFRESH ok aggs=${dailyAggsRaw.length}`);
-    } else if (!quiet) {
+    if (!res?.ok) {
+      if (!quiet) {
+        log(
+          `[sync-session] ACTIVITY_REFRESH échec ${res?.status ?? 0} ${res?.error ?? res?.reason ?? "unknown"}`,
+        );
+      }
+      return res;
+    }
+
+    let activeToken = res?.token ?? token;
+    let sentSamples = 0;
+    try {
+      const scoringRes = await postActivityScoringBlocksFromDaily({
+        token: activeToken,
+        baseShell,
+        dailyAggsRaw,
+        logPrefix: "activity-refresh",
+      });
+      activeToken = scoringRes?.token ?? activeToken;
+      sentSamples = scoringRes?.sentSamples ?? 0;
+    } catch (scoringErr) {
       log(
-        `[sync-session] ACTIVITY_REFRESH échec ${res?.status ?? 0} ${res?.error ?? res?.reason ?? "unknown"}`,
+        `Rafraîchissement scoring post-activité: ${formatSyncError(scoringErr, "activity-refresh-scoring")}`,
       );
     }
-    return res;
+
+    if (!quiet) {
+      log(
+        `[sync-session] ACTIVITY_REFRESH ok aggs=${dailyAggsRaw.length} scoring_samples=${sentSamples}`,
+      );
+    }
+    return { ...res, token: activeToken, scoringSamples: sentSamples };
   }
 
   async function runRecomputeWithActivityRefresh(Health, token, options = {}) {
@@ -5523,6 +5592,177 @@
       sentAggregates: overlayDays,
       body: stepsRes.body,
     };
+  }
+
+  /**
+   * Réparation 1× fenêtre récente (14 j) : kcal agrégats + samples |agg| pas/cal/FC repos.
+   * Comble trous énergie (UI) et effort (fallback calories) sans refaire le backfill 1 an.
+   */
+  async function runHistoricalActivityCaloriesRepair(Health, token) {
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - daysToMs(RECENT_ACTIVITY_REPAIR_DAYS));
+    const startIso = startDate.toISOString();
+    const endIso = endDate.toISOString();
+    const endIsoQuery = new Date(endDate.getTime() + 60 * 1000).toISOString();
+    const syncId = crypto.randomUUID();
+    const errors = {};
+    const readGranted = [];
+    const readDenied = [];
+
+    const authStatus = await Health.checkAuthorization(HEALTH_AUTH_PERMS);
+    const grantedSet = new Set(authStatus?.readAuthorized ?? []);
+    for (const spec of STATISTICS_DAILY_SPECS) {
+      if (grantedSet.has(spec.type)) readGranted.push(spec.type);
+      else readDenied.push(spec.type);
+    }
+    if (!grantedSet.has("calories") && !grantedSet.has("steps")) {
+      log("Réparation énergie: permissions calories/steps absentes");
+      return { ok: false, reason: "no_activity_perm", token };
+    }
+
+    let pluginVersion = "unknown";
+    try {
+      const v = await Health.getPluginVersion();
+      pluginVersion = v?.version ?? "unknown";
+    } catch (_) {}
+
+    const hasQueryAggregated = typeof Health.queryAggregated === "function";
+    let dailyAggsRaw = await fetchDailyAggregatesFromHealthKit(
+      Health,
+      startIso,
+      endIsoQuery,
+      errors,
+      grantedSet,
+    );
+    dailyAggsRaw = await fillStepsGapsInDailyAggregates(
+      Health,
+      dailyAggsRaw,
+      startIso,
+      endIsoQuery,
+      grantedSet,
+    );
+
+    const activityRows = (dailyAggsRaw ?? []).filter(
+      (row) =>
+        row?.day &&
+        (Number(row.steps_total) > 0 ||
+          Number(row.calories_total_kcal) > 0 ||
+          Number(row.resting_heart_rate_avg) > 0),
+    );
+    if (activityRows.length === 0) {
+      log("Réparation énergie: aucune activité HealthKit sur la fenêtre récente");
+      return { ok: true, skipped: true, reason: "no_activity_in_healthkit", token };
+    }
+
+    const baseShell = buildSyncBasePayload({
+      syncId,
+      startIso,
+      endIso,
+      pluginVersion,
+      readGranted,
+      readDenied,
+      errors,
+      hasQueryAggregated,
+      strategy: "healthkit_activity_calories_repair",
+    });
+
+    const postQueue = createPostQueue(token);
+    const scoringRes = await postActivityScoringBlocksFromDaily({
+      token,
+      baseShell,
+      dailyAggsRaw: activityRows,
+      postQueue,
+      logPrefix: "activity-repair",
+    });
+    if (!scoringRes.ok) {
+      return { ...scoringRes, token: postQueue.getToken() };
+    }
+
+    const overlay = activityOverlayDailyAggregates(activityRows);
+    if (overlay.length > 0) {
+      const aggPayload = payloadShell(baseShell, {
+        samples_by_type: {},
+        daily_aggregates: overlay,
+        workouts: { items: [] },
+      });
+      log(`  POST activity-repair daily_aggregates (${overlay.length} j)…`);
+      const aggRes = await postQueue.push("activity-repair-aggs", aggPayload);
+      if (!aggRes.ok) {
+        return {
+          ...aggRes,
+          token: postQueue.getToken(),
+          sentSamples: scoringRes.sentSamples ?? 0,
+        };
+      }
+    }
+
+    log(
+      `Réparation énergie/effort terminée — ${scoringRes.sentSamples ?? 0} sample(s), ${overlay.length} jour(s) overlay`,
+    );
+    return {
+      ok: true,
+      token: postQueue.getToken(),
+      sentSamples: scoringRes.sentSamples ?? 0,
+      sentAggregates: overlay.length,
+    };
+  }
+
+  async function maybeRepairHistoricalActivityCalories(Health, token, options) {
+    if (options?.skipActivityCaloriesRepair || options?.fullLookback) {
+      return { applied: false, reason: "skipped_by_options", token };
+    }
+    if (getSyncScopedItem(ACTIVITY_CALORIES_REPAIR_KEY, token)) {
+      return { applied: false, reason: "already_done", token };
+    }
+    if (!isFullBackfillComplete(token)) {
+      return { applied: false, reason: "backfill_incomplete", token };
+    }
+
+    const probe = window.PcpHealthServerBackfillProbe;
+    if (!probe?.probeServerActivityCaloriesGaps) {
+      return { applied: false, reason: "no_probe", token };
+    }
+
+    let gaps;
+    try {
+      gaps = await probe.probeServerActivityCaloriesGaps(token, options);
+    } catch (err) {
+      log(`Probe calories/effort gaps: ${formatSyncError(err, "activity-calories-gaps")}`);
+      return { applied: false, reason: "probe_error", token };
+    }
+
+    if (!gaps?.missingCount) {
+      setSyncScopedItem(ACTIVITY_CALORIES_REPAIR_KEY, String(Date.now()), token);
+      log("Réparation énergie: serveur OK — pas de trou récent kcal/effort");
+      log("[sync-session] ACTIVITY_CALORIES_REPAIR skip (rien à réparer)");
+      return { applied: false, reason: "no_gaps", token };
+    }
+
+    const preview = gaps.missingDays.slice(0, 5).join(", ");
+    const more = gaps.missingCount > 5 ? ` +${gaps.missingCount - 5}` : "";
+    log(
+      `Réparation énergie/effort ${gaps.repairWindowDays ?? RECENT_ACTIVITY_REPAIR_DAYS}j — ${gaps.missingCount} jour(s) (${preview}${more})`,
+    );
+    log(`[sync-session] ACTIVITY_CALORIES_REPAIR début missing=${gaps.missingCount}`);
+
+    const result = await runHistoricalActivityCaloriesRepair(Health, token);
+    if (result.ok && (result.sentSamples ?? 0) > 0) {
+      setSyncScopedItem(ACTIVITY_CALORIES_REPAIR_KEY, String(Date.now()), token);
+      log(
+        `[sync-session] ACTIVITY_CALORIES_REPAIR ok samples=${result.sentSamples ?? 0} aggs=${result.sentAggregates ?? 0}`,
+      );
+      return { applied: true, ...result };
+    }
+    if (result.ok && result.skipped) {
+      setSyncScopedItem(ACTIVITY_CALORIES_REPAIR_KEY, String(Date.now()), token);
+      log("[sync-session] ACTIVITY_CALORIES_REPAIR skip (pas Santé) — retry au prochain sync");
+      return { applied: false, ...result };
+    }
+
+    log(
+      `[sync-session] ACTIVITY_CALORIES_REPAIR échec ${result.error ?? result.reason ?? "unknown"}`,
+    );
+    return { applied: false, ...result };
   }
 
   async function maybeRepairHistoricalSteps(Health, token, options) {
@@ -6266,6 +6506,15 @@
         log(`Réparation pas exception: ${formatSyncError(repairErr, "steps-repair")}`);
       }
       try {
+        const activityRepair = await maybeRepairHistoricalActivityCalories(Health, activeToken, options);
+        activeToken = activityRepair?.token ?? activeToken;
+        if (activityRepair?.applied) forceRecomputeAfterSync = true;
+      } catch (activityRepairErr) {
+        log(
+          `Réparation énergie exception: ${formatSyncError(activityRepairErr, "activity-calories-repair")}`,
+        );
+      }
+      try {
         const sleepRepair = await maybeRepairHistoricalSleepStages(Health, activeToken, options);
         activeToken = sleepRepair?.token ?? activeToken;
       } catch (sleepRepairErr) {
@@ -6549,6 +6798,7 @@
     BACKFILL_PENDING_KEY,
     HISTORICAL_CHECKPOINT_KEY,
     STEPS_REPAIR_KEY,
+    ACTIVITY_CALORIES_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_KEY,
     SLEEP_STAGES_REPAIR_ATTEMPTS_KEY,
     DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY,

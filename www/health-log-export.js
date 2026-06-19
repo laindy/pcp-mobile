@@ -111,6 +111,17 @@
         );
       } catch (_) {}
       try {
+        const activityRepairKey =
+          storage?.ACTIVITY_CALORIES_REPAIR_KEY || "pcpHealthActivityCaloriesRepairV1";
+        const activityRepairAt = storage?.getItem
+          ? storage.getItem(activityRepairKey)
+          : sessionStorage.getItem(pid ? `${activityRepairKey}:${pid}` : activityRepairKey);
+        const repairDays = global.PcpHealthSyncConstants?.RECENT_ACTIVITY_REPAIR_DAYS ?? 14;
+        parts.push(
+          `Réparation énergie/effort ${repairDays}j (1×): ${activityRepairAt ? `effectuée ${new Date(parseInt(activityRepairAt, 10)).toISOString()}` : "en attente si kcal/effort récents manquants"}`,
+        );
+      } catch (_) {}
+      try {
         const intradayDays =
           global.PcpHealthSyncConstants?.SAMPLE_INTRADAY_LOOKBACK_DAYS ?? 90;
         const sleepStagesKey = storage?.SLEEP_STAGES_REPAIR_KEY || "pcpHealthSleepStagesRepairV2";

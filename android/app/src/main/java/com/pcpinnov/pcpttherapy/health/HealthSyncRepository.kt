@@ -101,6 +101,55 @@ class HealthSyncRepository(private val context: Context) {
         )
     }
 
+    /** Réparation énergie/effort — agrégats + samples scoring pas/cal sur fenêtre récente. */
+    suspend fun collectActivityCaloriesRepairOnly(startMillis: Long, endMillis: Long): SyncPayload {
+        val start = Instant.ofEpochMilli(startMillis)
+        val end = Instant.ofEpochMilli(endMillis)
+        val dailyByDay = mutableMapOf<LocalDate, DailyAggregate>()
+        val samplesByType = mutableMapOf<String, MutableList<SamplePoint>>()
+        val errors = mutableMapOf<String, String>()
+        val granted = client.permissionController.getGrantedPermissions()
+        val grantedDataTypes = mutableSetOf<String>()
+        val deniedDataTypes = mutableSetOf<String>()
+
+        runRead("steps", HealthPermission.getReadPermission(StepsRecord::class), granted, grantedDataTypes, deniedDataTypes, errors) {
+            aggregateBuckets(start, end, listOf(StepsRecord.COUNT_TOTAL)).forEach { (day, result) ->
+                result[StepsRecord.COUNT_TOTAL]?.let { daily(day, dailyByDay).stepsTotal = it }
+            }
+            fillStepsFromRecords(start, end, dailyByDay)
+        }
+        runRead("calories", HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class), granted, grantedDataTypes, deniedDataTypes, errors) {
+            aggregateBuckets(start, end, listOf(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL)).forEach { (day, result) ->
+                result[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories?.let {
+                    daily(day, dailyByDay).caloriesTotalKcal = it
+                }
+            }
+            fillCaloriesFromRecords(start, end, dailyByDay)
+        }
+
+        for ((type, samples) in buildScoringSamples(dailyByDay)) {
+            if (samples.isEmpty()) continue
+            samplesByType[type] = samples.toMutableList()
+        }
+
+        val activityRows = dailyByDay.values.filter {
+            (it.stepsTotal ?: 0L) > 0L ||
+                (it.caloriesTotalKcal ?: 0.0) > 0.0 ||
+                (it.restingHeartRateAvg ?: 0.0) > 0.0
+        }.sortedBy { it.day }
+
+        return SyncPayload(
+            windowStart = start,
+            windowEnd = end,
+            grantedDataTypes = grantedDataTypes.toList(),
+            deniedDataTypes = deniedDataTypes.toList(),
+            errors = errors,
+            samplesByType = samplesByType,
+            dailyAggregates = activityRows,
+            workouts = emptyList(),
+        )
+    }
+
     suspend fun collect(startMillis: Long, endMillis: Long, phaseLabel: String = "sync"): SyncPayload {
         val granted = client.permissionController.getGrantedPermissions()
         Log.i(tag, "Permissions HC accordées : ${granted.size}")

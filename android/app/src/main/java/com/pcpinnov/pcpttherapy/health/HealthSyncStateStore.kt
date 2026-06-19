@@ -14,6 +14,7 @@ object HealthSyncStateStore {
     const val KEY_HISTORICAL_CHECKPOINT = "pcpHealthHistoricalCheckpoint"
     const val KEY_LAST_DATA_SYNC_AT = "pcpHealthLastDataSyncAt"
     const val KEY_STEPS_REPAIR = "pcpHealthStepsRepairV2"
+    const val KEY_ACTIVITY_CALORIES_REPAIR = "pcpHealthActivityCaloriesRepairV1"
     const val KEY_AGGREGATES_BACKFILL = "pcpHealthAggregatesV8"
     const val KEY_VITALS_DAILY_REPAIR = "pcpHealthVitalsDailyRepairV1"
     const val KEY_SLEEP_DAILY_REPAIR = "pcpHealthSleepDailyRepairV2"

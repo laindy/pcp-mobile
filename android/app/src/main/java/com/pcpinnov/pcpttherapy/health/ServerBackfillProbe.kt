@@ -23,6 +23,7 @@ object ServerBackfillProbe {
     private const val MIN_HISTORICAL_STAGED_NIGHTS = 20
     private const val MIN_HISTORICAL_SLEEP_NIGHTS_TO_REQUIRE = 10
     private const val PRIORITY_LOOKBACK_DAYS = 7L
+    private const val RECENT_ACTIVITY_REPAIR_DAYS = 14L
     private const val SAMPLE_INTRADAY_LOOKBACK_DAYS = 90L
     private const val SLEEP_SAMPLES_PROBE_MAX_PAGES = 16
     private const val OLDEST_SLACK_DAYS = 14L
@@ -45,6 +46,13 @@ object ServerBackfillProbe {
         val missingCount: Int,
         val missingDays: List<String>,
         val rowCount: Int,
+    )
+
+    data class ActivityCaloriesGaps(
+        val missingCount: Int,
+        val missingDays: List<String>,
+        val rowCount: Int,
+        val repairWindowDays: Int = RECENT_ACTIVITY_REPAIR_DAYS.toInt(),
     )
 
     data class SleepStagesGaps(
@@ -145,6 +153,64 @@ object ServerBackfillProbe {
     fun probeStepsGaps(store: TokenStore, http: OkHttpClient): StepsGaps {
         val probe = probeServerHistoricalCoverage(store, http)
         return evaluateStepsGaps(probe.rows)
+    }
+
+    fun probeActivityCaloriesGaps(store: TokenStore, http: OkHttpClient): ActivityCaloriesGaps {
+        val probe = probeServerHistoricalCoverage(store, http)
+        return evaluateActivityCaloriesGaps(probe.rows)
+    }
+
+    private fun recentActivityRepairCutoffDay(): LocalDate =
+        LocalDate.now().minusDays(RECENT_ACTIVITY_REPAIR_DAYS)
+
+    private fun isRecentActivityRepairDay(day: LocalDate): Boolean =
+        !day.isBefore(recentActivityRepairCutoffDay())
+
+    private fun dayRowMissingCalories(row: JSONObject): Boolean {
+        val dayStr = row.optString("day", "")
+        if (dayStr.isBlank()) return false
+        val day = try {
+            LocalDate.parse(dayStr, DAY_FMT)
+        } catch (_: Exception) {
+            return false
+        }
+        if (!isRecentActivityRepairDay(day)) return false
+        if (row.optDouble("calories_total_kcal", 0.0) > 0.0) return false
+        if (row.optInt("steps_total", 0) > 0) return true
+        if (row.optInt("sleep_total_min", 0) > 0) return true
+        if (row.optDouble("hrv_avg_ms", 0.0) > 0.0) return true
+        if (row.optDouble("resting_heart_rate_avg", 0.0) > 0.0) return true
+        if (row.optDouble("respiratory_rate_avg", 0.0) > 0.0) return true
+        if (row.optDouble("oxygen_saturation_avg", 0.0) > 0.0) return true
+        return false
+    }
+
+    private fun dayRowMissingEffortDespiteCalories(row: JSONObject): Boolean {
+        val dayStr = row.optString("day", "")
+        if (dayStr.isBlank()) return false
+        val day = try {
+            LocalDate.parse(dayStr, DAY_FMT)
+        } catch (_: Exception) {
+            return false
+        }
+        if (!isRecentActivityRepairDay(day)) return false
+        if (row.optDouble("calories_total_kcal", 0.0) <= 0.0) return false
+        return !row.has("effort_score") || row.isNull("effort_score")
+    }
+
+    private fun evaluateActivityCaloriesGaps(rows: JSONArray): ActivityCaloriesGaps {
+        val missing = sortedSetOf<String>()
+        for (i in 0 until rows.length()) {
+            val row = rows.optJSONObject(i) ?: continue
+            if (dayRowMissingCalories(row) || dayRowMissingEffortDespiteCalories(row)) {
+                missing += row.optString("day", "")
+            }
+        }
+        return ActivityCaloriesGaps(
+            missingCount = missing.size,
+            missingDays = missing.toList(),
+            rowCount = rows.length(),
+        )
     }
 
     private data class CoverageProbe(

@@ -100,6 +100,12 @@ object HealthSyncExecutor {
             Log.w(TAG, "Steps repair: ${e.message}")
         }
 
+        try {
+            ActivityCaloriesRepairExecutor.maybeRun(app, store, repository, http)
+        } catch (e: Exception) {
+            Log.w(TAG, "Activity calories repair: ${e.message}")
+        }
+
         BackgroundSleepStagesRepair.enqueue(app, store, repository, http)
 
         try {
