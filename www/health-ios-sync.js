@@ -5,8 +5,6 @@
 (function () {
   const SYNC_CONST = window.PcpHealthSyncConstants || {};
   const SYNC_ENDPOINT = "/api/v1/patients/me/health/sync";
-  const RECOMPUTE_ENDPOINT = "/api/v1/patients/me/health/recompute";
-  const RECOMPUTE_DAYS_DEFAULT = 90;
   /** Agrégats journaliers + probe serveur — 1 an. */
   const DAILY_AGGREGATE_LOOKBACK_DAYS =
     SYNC_CONST.DAILY_AGGREGATE_LOOKBACK_DAYS ?? 365;
@@ -3694,6 +3692,7 @@
     const grantedSet = new Set(authStatus?.readAuthorized ?? []);
 
     const onlyTypes = options?.onlyTypes;
+    const rollupScoringRefresh = !!options?.rollupScoringRefresh;
     const sleepOnlyRepair = Array.isArray(onlyTypes) && onlyTypes.length === 1 && onlyTypes[0] === "sleep";
     const vitalsOnlyRepair = Array.isArray(onlyTypes) && onlyTypes.length > 0 && !sleepOnlyRepair;
     const skipHeavyExtras = vitalsOnlyRepair || sleepOnlyRepair;
@@ -4106,7 +4105,7 @@
       };
     }
 
-    if (hasQueryAggregated && !onlyTypes) {
+    if (hasQueryAggregated && (!onlyTypes || rollupScoringRefresh)) {
       const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw, vitalNightIndex);
       const scoringOrder = ["steps", "calories", "restingHeartRate"];
       for (const type of scoringOrder) {
@@ -4557,7 +4556,7 @@
         };
       }
       if (wRes.body) postBodies.push(wRes.body);
-    } else if (dailyAggregates.length > 0 && !onlyTypes) {
+    } else if (dailyAggregates.length > 0 && (!onlyTypes || rollupScoringRefresh)) {
       const payload = payloadShell(baseShell, {
         samples_by_type: {},
         daily_aggregates: dailyAggregates,
@@ -5244,77 +5243,201 @@
     return { ok: true, status: res.status, body, token: authToken };
   }
 
-  async function postHealthRecompute(token, options) {
-    const quiet = !!(options && options.quiet);
-    const daysRaw = Number(options?.days ?? RECOMPUTE_DAYS_DEFAULT);
-    const days = Number.isFinite(daysRaw) ? Math.min(365, Math.max(1, Math.round(daysRaw))) : RECOMPUTE_DAYS_DEFAULT;
-    let authToken =
-      options?.authToken != null ? options.authToken : await resolveSyncAccessToken(token);
-    if (!authToken) {
-      return {
-        ok: false,
-        status: 401,
-        body: { detail: "Session expired" },
-        error: "Session expired",
-      };
+  /**
+   * Re-sync j 1–7 après backfill — même logique que la 2ᵉ sync manuelle (phase incremental).
+   * Le catch-up + onlyTypes en streaming ne reproduisait pas ce flux.
+   */
+  async function refreshPriorityScoringRollups(Health, token, options = {}) {
+    const quiet = !!options.quiet;
+    const lookbackDays = Number(options.days ?? PRIORITY_LOOKBACK_DAYS);
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - daysToMs(lookbackDays));
+    if (!quiet) {
+      log(
+        `Rafraîchissement rollup scoring j 1–${lookbackDays} (phase incremental, comme sync manuelle)…`,
+      );
     }
-
-    const doPost = async (bearer) =>
-      fetch(`${RECOMPUTE_ENDPOINT}?days=${days}`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${bearer}`,
-          Accept: "application/json",
-        },
-      });
-
-    let res;
-    try {
-      res = await doPost(authToken);
-    } catch (fetchErr) {
-      return {
-        ok: false,
-        status: 0,
-        body: null,
-        error: formatSyncError(fetchErr, "POST recompute"),
-        token: authToken,
-      };
+    log("[sync-session] ROLLUP_REFRESH_PRIORITY début");
+    const result = await collectAndStreamPost(Health, startDate, endDate, token, {
+      manual: false,
+      phase: "incremental",
+      repairStrategy: "rollup_refresh_priority_scoring",
+    });
+    if (result.body) {
+      log("──── Réponse backend (rollup incremental) ────");
+      logSyncPostResponse(result.body);
     }
-    if (res.status === 401 && window.PcpHealthBridge?.refreshAccessToken) {
-      try {
-        const renewed = await window.PcpHealthBridge.refreshAccessToken();
-        if (renewed) {
-          authToken = renewed;
-          res = await doPost(renewed);
-        }
-      } catch (refreshErr) {
-        if (!quiet) log(formatSyncError(refreshErr, "refresh token (recompute)"));
-      }
+    if (result.ok) {
+      log(
+        `[sync-session] ROLLUP_REFRESH_PRIORITY ok samples=${result.sentSamples ?? 0} aggs=${result.sentAggregates ?? 0}`,
+      );
+    } else {
+      log(
+        `[sync-session] ROLLUP_REFRESH_PRIORITY échec ${result.status ?? 0} ${result.error ?? result.reason ?? "unknown"}`,
+      );
     }
-
-    const raw = await res.text();
-    let body;
-    try {
-      body = raw ? JSON.parse(raw) : {};
-    } catch {
-      body = { raw };
-    }
-    if (!res.ok) {
-      const detail =
-        body?.detail != null
-          ? typeof body.detail === "string"
-            ? body.detail
-            : JSON.stringify(body.detail)
-          : raw.slice(0, 400);
-      if (!quiet) log(`POST recompute HTTP ${res.status} — ${String(detail).slice(0, 300)}`);
-      return { ok: false, status: res.status, body, error: detail, token: authToken };
-    }
-    return { ok: true, status: res.status, body, token: authToken, days };
+    return result;
   }
 
   /**
-   * Après RECOMPUTE 90j (recovery) : réaligne pas/cal/FC repos sur Santé Apple via
-   * daily_aggregates — le recompute peut recalculer les totaux depuis vieux samples |agg|.
+   * Un seul POST /sync : daily_aggregates (jours calendaires) + samples scoring.
+   * Garantit le rollup recovery/stress sur j1–7 même si le streaming a tout mis en doublons.
+   */
+  async function postRollupTouchSingleShot(Health, token, options = {}) {
+    const quiet = !!options.quiet;
+    const lookbackDays = Number(options.days ?? PRIORITY_LOOKBACK_DAYS);
+    if (!Health || typeof Health.queryAggregated !== "function") {
+      return { ok: false, skipped: true, reason: "no_query_aggregated", token };
+    }
+
+    const endDate = new Date();
+    const startDate = new Date(endDate.getTime() - daysToMs(lookbackDays));
+    const startIso = startDate.toISOString();
+    const endIso = endDate.toISOString();
+    const endIsoQuery = new Date(endDate.getTime() + 60 * 1000).toISOString();
+    const errors = {};
+    const readGranted = [];
+    const readDenied = [];
+
+    const authStatus = await Health.checkAuthorization(HEALTH_AUTH_PERMS);
+    const grantedSet = new Set(authStatus?.readAuthorized ?? []);
+    for (const spec of STATISTICS_DAILY_SPECS) {
+      if (grantedSet.has(spec.type)) readGranted.push(spec.type);
+      else readDenied.push(spec.type);
+    }
+
+    let dailyAggsRaw = await fetchDailyAggregatesFromHealthKit(
+      Health,
+      startIso,
+      endIsoQuery,
+      errors,
+      grantedSet,
+    );
+    dailyAggsRaw = await fillStepsGapsInDailyAggregates(
+      Health,
+      dailyAggsRaw,
+      startIso,
+      endIsoQuery,
+      grantedSet,
+    );
+
+    let sleepDailyRows = [];
+    if (grantedSet.has("sleep")) {
+      try {
+        const sleepRead = await readAllSleepSamples(Health, startIso, endIsoQuery, { light: true });
+        sleepDailyRows = sleepRead.dailyRows ?? [];
+      } catch (sleepErr) {
+        log(`Rollup touch sommeil: ${formatSyncError(sleepErr, "rollup-touch-sleep")}`);
+      }
+    }
+
+    let dailyAggregates = mergeFinalDailyAggregates({}, dailyAggsRaw, sleepDailyRows, true);
+    dailyAggregates = filterDailyAggregatesForPost(dailyAggregates);
+    if (!dailyAggregates.length) {
+      return { ok: false, skipped: true, reason: "no_postable_days", token };
+    }
+
+    let pluginVersion = "unknown";
+    try {
+      const v = await Health.getPluginVersion();
+      pluginVersion = v?.version ?? "unknown";
+    } catch (_) {}
+
+    const baseShell = buildSyncBasePayload({
+      syncId: crypto.randomUUID(),
+      startIso,
+      endIso,
+      pluginVersion,
+      readGranted,
+      readDenied,
+      errors,
+      hasQueryAggregated: true,
+      strategy: "healthkit_rollup_touch_single_shot",
+    });
+
+    const scoringBlocks = buildScoringSamplesFromDailyAggregates(dailyAggsRaw);
+    const samplesByType = {};
+    let sentSamples = 0;
+    for (const [type, block] of Object.entries(scoringBlocks)) {
+      if (!block?.samples?.length) continue;
+      samplesByType[type] = block;
+      sentSamples += block.samples.length;
+    }
+
+    const payload = payloadShell(baseShell, {
+      samples_by_type: samplesByType,
+      daily_aggregates: dailyAggregates,
+      workouts: { items: [] },
+    });
+
+    if (!quiet) {
+      log(
+        `  Rollup touch 1 lot — aggs=${dailyAggregates.length} j scoring_samples=${sentSamples}…`,
+      );
+    }
+    log("[sync-session] ROLLUP_TOUCH_SINGLE début");
+    const res = await postHealthSyncWithRetry(token, payload, "rollup-touch", { quiet });
+    if (res?.body) {
+      log("──── Réponse backend (rollup touch) ────");
+      logSyncPostResponse(res.body);
+    }
+    if (res?.ok) {
+      log(
+        `[sync-session] ROLLUP_TOUCH_SINGLE ok aggs=${dailyAggregates.length} scoring_samples=${sentSamples}`,
+      );
+    } else {
+      log(
+        `[sync-session] ROLLUP_TOUCH_SINGLE échec ${res?.status ?? 0} ${res?.error ?? res?.reason ?? "unknown"}`,
+      );
+    }
+    return { ...res, sentSamples, sentAggregates: dailyAggregates.length };
+  }
+
+  /**
+   * Rollup recovery/stress j1–7 — synchrone, juste après backfill (avant backfill-finished).
+   * Équivalent à la 2ᵉ sync manuelle, sans timer ni POST /recompute.
+   */
+  async function finalizeScoringRollupAfterBackfill(Health, token, options = {}) {
+    const quiet = !!options.quiet;
+    const days = options.rollupDays ?? PRIORITY_LOOKBACK_DAYS;
+    let activeToken = token;
+
+    log(`[sync-session] SCORING_ROLLUP_FIN début — rollup j1–${days} post-backfill (bloquant)`);
+
+    async function runOnce() {
+      const touch = await postRollupTouchSingleShot(Health, activeToken, { quiet, days });
+      activeToken = touch?.token ?? activeToken;
+      const rollup = await refreshPriorityScoringRollups(Health, activeToken, { quiet, days });
+      activeToken = rollup?.token ?? activeToken;
+      return { touch, rollup, ok: !!(touch?.ok && rollup?.ok) };
+    }
+
+    let attempt = await runOnce();
+    if (!attempt.ok) {
+      log(
+        `[sync-session] SCORING_ROLLUP_FIN retry immédiat touch=${!!attempt.touch?.ok} incremental=${!!attempt.rollup?.ok}`,
+      );
+      attempt = await runOnce();
+    }
+
+    if (attempt.ok) {
+      log(`[sync-session] SCORING_ROLLUP_FIN ok — recovery/stress rollup j1–${days} terminé`);
+    } else {
+      log(
+        `[sync-session] SCORING_ROLLUP_FIN échec touch=${!!attempt.touch?.ok} incremental=${!!attempt.rollup?.ok}`,
+      );
+    }
+
+    return {
+      ok: attempt.ok,
+      touch: attempt.touch,
+      rollup: attempt.rollup,
+      token: activeToken,
+    };
+  }
+
+  /**
+   * Après rollup refresh : réaligne pas/cal/FC repos sur Santé Apple via daily_aggregates.
    */
   async function refreshRecentActivityAggregates(Health, token, options = {}) {
     const quiet = !!options.quiet;
@@ -5353,6 +5476,7 @@
       endIsoQuery,
       grantedSet,
     );
+    dailyAggsRaw = filterDailyAggregatesForPost(dailyAggsRaw);
     if (!dailyAggsRaw.length) {
       return { ok: true, skipped: true, reason: "no_activity_aggs", token };
     }
@@ -5372,7 +5496,7 @@
       readDenied,
       errors,
       hasQueryAggregated: true,
-      strategy: "healthkit_activity_refresh_post_recompute",
+      strategy: "healthkit_activity_refresh_post_rollup",
     });
     const payload = payloadShell(baseShell, {
       samples_by_type: {},
@@ -5382,7 +5506,7 @@
 
     if (!quiet) {
       log(
-        `  Rafraîchissement pas/cal post-recompute (${dailyAggsRaw.length} j depuis HK statistics)…`,
+        `  Rafraîchissement pas/cal post-rollup (${dailyAggsRaw.length} j depuis HK statistics)…`,
       );
     }
     const res = await postHealthSyncWithRetry(token, payload, "activity-refresh", { quiet });
@@ -5420,25 +5544,49 @@
     return { ...res, token: activeToken, scoringSamples: sentSamples };
   }
 
-  async function runRecomputeWithActivityRefresh(Health, token, options = {}) {
-    const recompute = await postHealthRecompute(token, options);
-    let activeToken = recompute?.token ?? token;
-    if (!recompute?.ok) return { recompute, token: activeToken };
-
+  /** Rollup recovery/stress via POST sync (pas POST /recompute — endpoint absent côté backend). */
+  async function runScoringRollupRefresh(Health, token, options = {}) {
+    let activeToken = token;
+    let touch = null;
+    let rollup = null;
+    let activity = null;
     if (Health) {
       try {
-        const refresh = await refreshRecentActivityAggregates(Health, activeToken, {
+        touch = await postRollupTouchSingleShot(Health, activeToken, {
+          quiet: options.quiet,
+          days: options.rollupDays ?? PRIORITY_LOOKBACK_DAYS,
+        });
+        activeToken = touch?.token ?? activeToken;
+      } catch (touchErr) {
+        log(`Rollup touch single-shot: ${formatSyncError(touchErr, "rollup-touch")}`);
+      }
+      try {
+        rollup = await refreshPriorityScoringRollups(Health, activeToken, {
+          quiet: options.quiet,
+          days: options.rollupDays ?? PRIORITY_LOOKBACK_DAYS,
+        });
+        activeToken = rollup?.token ?? activeToken;
+      } catch (rollupErr) {
+        log(`Rollup refresh priority: ${formatSyncError(rollupErr, "rollup-refresh")}`);
+      }
+      try {
+        activity = await refreshRecentActivityAggregates(Health, activeToken, {
           quiet: options.quiet,
           days: options.activityRefreshDays ?? PRIORITY_LOOKBACK_DAYS + 1,
         });
-        activeToken = refresh?.token ?? activeToken;
+        activeToken = activity?.token ?? activeToken;
+        if (activity?.body) {
+          log("──── Réponse backend (activity refresh) ────");
+          logSyncPostResponse(activity.body);
+        }
       } catch (refreshErr) {
         log(
-          `Rafraîchissement activité post-recompute: ${formatSyncError(refreshErr, "activity-refresh")}`,
+          `Rafraîchissement activité post-rollup: ${formatSyncError(refreshErr, "activity-refresh")}`,
         );
       }
     }
-    return { recompute, token: activeToken };
+    const ok = !!(touch?.ok || rollup?.ok || activity?.ok);
+    return { ok, touch, rollup, activity, token: activeToken };
   }
 
   function storeSyncSummary(detail) {
@@ -6213,29 +6361,17 @@
     await tryRepair("recovery-rescore-repair", maybeRepairRecoveryRescore);
 
     try {
-      const recompute = await runRecomputeWithActivityRefresh(Health, activeToken, {
-        authToken: activeToken,
+      const refresh = await finalizeScoringRollupAfterBackfill(Health, activeToken, {
         quiet: true,
-        days: options?.recomputeDays,
+        rollupDays: options?.rollupDays ?? PRIORITY_LOOKBACK_DAYS,
       });
-      activeToken = recompute?.token ?? activeToken;
-      if (recompute?.recompute?.ok) {
-        log(
-          `[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`,
-        );
-      } else if (forceRecompute) {
-        log(
-          `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
-        );
-      } else {
-        log("[sync-session] RECOMPUTE_SCORES skip (post-backfill — rien à recalculer)");
-      }
+      activeToken = refresh?.token ?? activeToken;
       log("[sync-session] POST_BACKFILL_PIPELINE fin");
-      return { token: activeToken, recompute, forceRecompute };
-    } catch (recomputeErr) {
-      log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
-      log("[sync-session] POST_BACKFILL_PIPELINE fin (recompute échec)");
-      return { token: activeToken, recompute: null, forceRecompute };
+      return { token: activeToken, refresh, forceRecompute, rollupOk: !!refresh?.ok };
+    } catch (refreshErr) {
+      log(`Rollup refresh exception: ${formatSyncError(refreshErr, "rollup-fin")}`);
+      log("[sync-session] POST_BACKFILL_PIPELINE fin (rollup échec)");
+      return { token: activeToken, refresh: null, forceRecompute, rollupOk: false };
     }
   }
 
@@ -6326,6 +6462,7 @@
     emitSyncEvent("pcp-health-backfill-started", { phases: phases.length });
     let activeToken = token;
     let backfillOk = false;
+    let rollupOk = false;
     void (async () => {
       try {
         const serverProbe = window.PcpHealthServerBackfillProbe;
@@ -6342,6 +6479,7 @@
             log("[sync-session] BACKFILL_ARRIÈRE_PLAN skip (serveur OK)");
             const pipeline = await runPostBackfillRepairPipeline(Health, activeToken, { manual: false });
             activeToken = pipeline?.token ?? activeToken;
+            rollupOk = !!pipeline?.rollupOk;
             return;
           }
         }
@@ -6396,6 +6534,7 @@
           setHistoricalBackfillPending(activeToken, false);
           const pipeline = await runPostBackfillRepairPipeline(Health, activeToken, { manual: false });
           activeToken = pipeline?.token ?? activeToken;
+          rollupOk = !!pipeline?.rollupOk;
           log(
             `Backfill journalier ${DAILY_AGGREGATE_LOOKBACK_DAYS}j terminé — prochaines syncs en mode incrémental (${INCREMENTAL_LOOKBACK_HOURS}h)`,
           );
@@ -6413,7 +6552,7 @@
       } finally {
         window.__pcpHealthBackfillRunning = false;
         window.__pcpHealthBackfillRunningSince = 0;
-        emitSyncEvent("pcp-health-backfill-finished", { ok: backfillOk });
+        emitSyncEvent("pcp-health-backfill-finished", { ok: backfillOk, rollupOk });
         const pendingManual = window.__pcpPendingManualSync;
         if (pendingManual) {
           window.__pcpPendingManualSync = null;
@@ -6675,6 +6814,12 @@
           sessionStorage.setItem("pcpHealthLastSyncAt", phaseOkAt);
           if (backfillPending && pi === activePhases.length - 1) {
             log("Phase récente OK — données à jour ; historique démarre en arrière-plan");
+            emitSyncEvent("pcp-health-priority-sync-finished", {
+              ok: true,
+              sentSamples,
+              sentWorkouts,
+              sentAggregates,
+            });
           }
         }
       }
@@ -6720,34 +6865,26 @@
         setHistoricalBackfillPending(activeToken || token, false);
       }
       if (!backfillPending) {
-        const samplesInserted = Number(merged?.body?.samples_inserted ?? body?.samples_inserted ?? 0);
-        const incrementalOnly =
-          syncPlan.mode === "incremental" &&
-          activePhases.length > 0 &&
-          activePhases.every((p) => p.label === "incremental");
-        const shouldRecompute =
-          forceRecomputeAfterSync || (!incrementalOnly && samplesInserted > 0);
-        if (shouldRecompute) {
+        if (forceRecomputeAfterSync) {
           try {
-            const recompute = await runRecomputeWithActivityRefresh(Health, activeToken || token, {
+            const refresh = await runScoringRollupRefresh(Health, activeToken || token, {
               authToken: activeToken || token,
               quiet: true,
-              days: options?.recomputeDays,
             });
-            activeToken = recompute?.token ?? activeToken;
-            if (recompute?.recompute?.ok) {
-              log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
+            activeToken = refresh?.token ?? activeToken;
+            if (refresh?.ok) {
+              log(`[sync-session] ROLLUP_REFRESH ok j 1–${PRIORITY_LOOKBACK_DAYS} (post-réparation)`);
             } else {
               log(
-                `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
+                `[sync-session] ROLLUP_REFRESH échec ${refresh?.rollup?.status ?? 0} ${refresh?.rollup?.error ?? refresh?.rollup?.reason ?? "unknown"}`,
               );
             }
-          } catch (recomputeErr) {
-            log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
+          } catch (refreshErr) {
+            log(`Rollup refresh exception: ${formatSyncError(refreshErr, "rollup-refresh")}`);
           }
         } else {
           log(
-            `[sync-session] RECOMPUTE_SCORES skip (${incrementalOnly ? "incremental — rollup par lot" : "0 sample inséré"})`,
+            "[sync-session] ROLLUP_REFRESH skip (rollup déjà fait par POST sync — pas de /recompute)",
           );
         }
       }

@@ -292,6 +292,17 @@
       }, 120);
     });
 
+    window.addEventListener("pcp-health-priority-sync-finished", (ev) => {
+      const d = ev?.detail || {};
+      if (d.ok !== true) return;
+      window.setTimeout(() => {
+        scheduleRefreshAfterSync({
+          reason: "priority-7d",
+          retryMs: [800, 2500],
+        });
+      }, 150);
+    });
+
     window.addEventListener("pcp-health-backfill-finished", (ev) => {
       const d = ev?.detail || {};
       if (d.ok !== true) return;
@@ -303,7 +314,7 @@
         scheduleRefreshAfterSync({
           reason: "backfill-complete",
           pulse: true,
-          retryMs: [1000, 3000, 6000],
+          retryMs: [500, 2000, 5000],
         });
       }, 200);
     });
