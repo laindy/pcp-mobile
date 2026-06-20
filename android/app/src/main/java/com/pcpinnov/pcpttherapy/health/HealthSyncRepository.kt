@@ -346,7 +346,7 @@ class HealthSyncRepository(private val context: Context) {
             deniedDataTypes = deniedDataTypes.toList(),
             errors = errors,
             samplesByType = samplesByType,
-            dailyAggregates = dailyByDay.values.sortedBy { it.day },
+            dailyAggregates = ScoreRingDailyFilter.filterDailyAggregates(dailyByDay.values).sortedBy { it.day },
             workouts = workouts,
         )
     }
@@ -831,7 +831,10 @@ class HealthSyncRepository(private val context: Context) {
         for (type in types) {
             val raw = readSampleType(ctx, type, start, end)
             if (raw.isEmpty()) continue
-            val collapsed = HistoricalLightCompactor.compactVitalsForDailyExtended(raw, type, zone, nightIndex)
+            val collapsed = ScoreRingDailyFilter.filterVitalSamples(
+                HistoricalLightCompactor.compactVitalsForDailyExtended(raw, type, zone, nightIndex),
+                zone,
+            )
             if (collapsed.isEmpty()) continue
             Log.i(tag, "Vitaux daily-extended $type: ${raw.size} bruts → ${collapsed.size} jour(s)")
             out[type] = collapsed
@@ -843,6 +846,7 @@ class HealthSyncRepository(private val context: Context) {
     fun buildScoringSamples(dailyByDay: Map<LocalDate, DailyAggregate>): Map<String, List<SamplePoint>> {
         val out = mutableMapOf<String, MutableList<SamplePoint>>()
         for (row in dailyByDay.values) {
+            if (ScoreRingDailyFilter.isFutureDay(row.day, zone)) continue
             val steps = row.stepsTotal
             if (steps != null && steps > 0L) {
                 val noon = row.day.atTime(12, 0).atZone(zone).toInstant()

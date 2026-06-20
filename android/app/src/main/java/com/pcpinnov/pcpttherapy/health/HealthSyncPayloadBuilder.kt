@@ -4,6 +4,7 @@ import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
+import java.time.ZoneId
 import java.util.UUID
 
 /** Construit l'enveloppe POST `/api/v1/patients/me/health/sync` (contrat v1). */
@@ -28,17 +29,20 @@ object HealthSyncPayloadBuilder {
         phaseLabel: String,
         includeDailyAggregates: Boolean,
     ): JSONObject {
+        val zone = ZoneId.systemDefault()
         val samplesByType = JSONObject()
         for ((type, samples) in payload.samplesByType) {
             if (samples.isEmpty()) continue
             val block = JSONObject()
             block.put("data_type", type)
             block.put("unit_default", UNIT_DEFAULTS[type] ?: samples.first().unit)
-            block.put("sample_count", samples.size)
             val arr = JSONArray()
             for (sample in samples) {
+                if (!ScoreRingDailyFilter.isPostableVitalSample(sample, zone)) continue
                 arr.put(sampleToJson(sample))
             }
+            if (arr.length() == 0) continue
+            block.put("sample_count", arr.length())
             block.put("samples", arr)
             samplesByType.put(type, block)
         }
@@ -53,8 +57,7 @@ object HealthSyncPayloadBuilder {
 
         val aggregates = JSONArray()
         if (includeDailyAggregates) {
-            for (row in payload.dailyAggregates) {
-                if (!row.hasAnyValue()) continue
+            for (row in ScoreRingDailyFilter.filterDailyAggregates(payload.dailyAggregates, zone)) {
                 aggregates.put(dailyToJson(row))
             }
         }

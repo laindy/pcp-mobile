@@ -77,7 +77,9 @@ object HealthSyncStreaming {
         repository.readDailyAggregates(ctx, start, end)
 
         val scoring = repository.buildScoringSamples(ctx.dailyByDay)
-        val earlyOverlay = ctx.dailyByDay.values.filter { it.hasActivitySignal() }.sortedBy { it.day }
+        val earlyOverlay = ScoreRingDailyFilter.filterDailyAggregates(
+            ctx.dailyByDay.values.filter { it.hasActivitySignal() },
+        ).sortedBy { it.day }
 
         if (!deferPosts) {
             for (type in listOf("steps", "calories")) {
@@ -136,7 +138,9 @@ object HealthSyncStreaming {
 
         repository.finalizeSamples(ctx, merged, phaseLabel)
 
-        val dailyOverlay = ctx.dailyByDay.values.filter { it.hasAnyValue() }.sortedBy { it.day }
+        val dailyOverlay = ScoreRingDailyFilter.filterDailyAggregates(
+            ctx.dailyByDay.values.filter { it.hasAnyValue() },
+        ).sortedBy { it.day }
 
         val postOrder = merged.keys.toList() + listOf("workouts")
         for (type in postOrder) {
@@ -218,7 +222,9 @@ object HealthSyncStreaming {
         repository.enrichDailyWithSleep(ctx, start, end)
         val vitalSamples = repository.readDailyExtendedVitalsCompact(ctx, start, end)
         val scoring = repository.buildScoringSamples(ctx.dailyByDay)
-        val dailyOverlay = ctx.dailyByDay.values.filter { it.hasAnyValue() }.sortedBy { it.day }
+        val dailyOverlay = ScoreRingDailyFilter.filterDailyAggregates(
+            ctx.dailyByDay.values.filter { it.hasAnyValue() },
+        ).sortedBy { it.day }
 
         for (type in listOf("steps", "calories")) {
             val samples = scoring[type] ?: continue

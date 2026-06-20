@@ -958,6 +958,55 @@
     return `${y}-${m}-${day}`;
   }
 
+  /** Jour civil local (fuseau appareil) — borne haute pour les agrégats POSTés. */
+  function localCalendarTodayKey() {
+    return localDayKey(new Date().toISOString());
+  }
+
+  function isFutureScoreRingDay(dayKey) {
+    const today = localCalendarTodayKey();
+    return !!dayKey && !!today && dayKey > today;
+  }
+
+  function isVitalsOnlyPartialRow(row) {
+    const steps = toNum(row?.steps_total);
+    const kcal = toNum(row?.calories_total_kcal);
+    const sleep = toNum(row?.sleep_total_min);
+    const hasActivity = (steps != null && steps > 0) || (kcal != null && kcal > 0);
+    const hasSleep = sleep != null && sleep > 0;
+    return !hasActivity && !hasSleep;
+  }
+
+  /** Évite qu'un jour futur ou un aujourd'hui vitaux-seuls devienne GET /daily?limit=1. */
+  function isPostableDailyAggregateRow(row) {
+    const day = row?.day;
+    if (!day) return false;
+    if (isFutureScoreRingDay(day)) return false;
+    const today = localCalendarTodayKey();
+    if (day === today && isVitalsOnlyPartialRow(row)) return false;
+    return true;
+  }
+
+  function filterDailyAggregatesForPost(rows) {
+    return (rows ?? []).filter(isPostableDailyAggregateRow);
+  }
+
+  const NIGHT_VITAL_SAMPLE_TYPES = new Set([
+    "heartRateVariability",
+    "respiratoryRate",
+    "oxygenSaturation",
+    "bodyTemperature",
+    "restingHeartRate",
+  ]);
+
+  function filterNightVitalSamplesForPost(samples, dataType) {
+    if (!NIGHT_VITAL_SAMPLE_TYPES.has(dataType)) return samples ?? [];
+    return (samples ?? []).filter((s) => {
+      const wakeDay = vitalWakeDayFromIso(s.startDate);
+      return wakeDay && !isFutureScoreRingDay(wakeDay);
+    });
+  }
+
   function sleepDayKeyFromSample(sample) {
     return localDayKey(sample?.endDate ?? sample?.startDate);
   }
@@ -3287,6 +3336,7 @@
     }
     const out = [];
     for (const [wakeDay, vals] of byWake) {
+      if (isFutureScoreRingDay(wakeDay)) continue;
       const val =
         dataType === "heartRateVariability" ? medianOf(vals) : averageOf(vals);
       if (val == null || !Number.isFinite(val) || val <= 0) continue;
@@ -3333,7 +3383,7 @@
         log(`  daily-extended ${type}: ${rawSamples.length} bruts → ${samples.length} jour(s)`);
         if (samples.length === 0 && rawSamples.length > 0) {
           log(`  daily-extended ${type}: repli samples bruts (${rawSamples.length})`);
-          samples = rawSamples;
+          samples = filterNightVitalSamplesForPost(rawSamples, type);
         }
         if (samples.length > 0) out[type] = samples;
       } catch (err) {
@@ -3481,6 +3531,7 @@
       const samples = [];
       for (const row of dailyList ?? []) {
         if (!row?.day) continue;
+        if (!isPostableDailyAggregateRow(row)) continue;
         const val = toNum(row[spec.field]);
         if (val == null || val <= 0) continue;
         const sampleVal = spec.intValue ? Math.round(val) : val;
@@ -3536,7 +3587,7 @@
         global.PcpHealthDailyAggregates.buildFromSamplesByType(samplesByType),
       );
     }
-    return dailyAggregates;
+    return filterDailyAggregatesForPost(dailyAggregates);
   }
 
   /**
@@ -3561,7 +3612,8 @@
         if (row.primary_source) overlay.primary_source = row.primary_source;
         return has ? overlay : null;
       })
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter(isPostableDailyAggregateRow);
   }
 
   /**
@@ -4158,7 +4210,7 @@
           log(`  ${type} ${compactLabel}: ${rawSamples.length} bruts → ${samples.length} jour(s)`);
           if (samples.length === 0 && rawSamples.length > 0) {
             log(`  ${type} ${compactLabel}: repli samples bruts (${rawSamples.length})`);
-            samples = rawSamples;
+            samples = filterNightVitalSamplesForPost(rawSamples, type);
           }
         } else if (streamDenseChunks) {
           const streamRes = await readAndStreamSamplesByDateChunks(

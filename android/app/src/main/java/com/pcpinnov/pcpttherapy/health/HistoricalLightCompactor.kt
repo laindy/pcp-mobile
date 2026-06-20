@@ -116,6 +116,7 @@ object HistoricalLightCompactor {
         val byWake = samples.groupBy { vitalWakeDay(it.startAt, zone) }
         val out = mutableListOf<SamplePoint>()
         for ((wakeDay, list) in byWake) {
+            if (ScoreRingDailyFilter.isFutureDay(wakeDay, zone)) continue
             val vals = list.map { it.value }.filter { it.isFinite() && it > 0 }
             if (vals.isEmpty()) continue
             val value = if (useMedian) median(vals) else average(vals) ?: continue
