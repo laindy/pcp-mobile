@@ -180,6 +180,16 @@ object HealthSyncExecutor {
         repository: HealthSyncRepository,
     ) {
         try {
+            StepsRepairExecutor.maybeRun(context, store, repository, http)
+        } catch (e: Exception) {
+            Log.w(TAG, "Steps repair (post-backfill): ${e.message}")
+        }
+        try {
+            ActivityCaloriesRepairExecutor.maybeRun(context, store, repository, http)
+        } catch (e: Exception) {
+            Log.w(TAG, "Activity calories repair (post-backfill): ${e.message}")
+        }
+        try {
             VitalsResyncExecutor.maybeRun(context, store, repository, http)
         } catch (e: Exception) {
             Log.w(TAG, "Vitals daily repair: ${e.message}")

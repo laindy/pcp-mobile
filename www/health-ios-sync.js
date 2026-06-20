@@ -6183,6 +6183,62 @@
     return slices;
   }
 
+  /**
+   * Réparations 1× + rescoring après backfill terminé (ou skip serveur).
+   * Évite d'attendre une 2ᵉ sync manuelle pour remplir recovery/effort/stress.
+   */
+  async function runPostBackfillRepairPipeline(Health, token, options = {}) {
+    let activeToken = token;
+    let forceRecompute = false;
+    const repairOpts = { manual: false, ...options };
+
+    async function tryRepair(label, fn) {
+      try {
+        const result = await fn(Health, activeToken, repairOpts);
+        activeToken = result?.token ?? activeToken;
+        if (result?.applied) forceRecompute = true;
+        return result;
+      } catch (err) {
+        log(`${label} exception: ${formatSyncError(err, label)}`);
+        return null;
+      }
+    }
+
+    log("[sync-session] POST_BACKFILL_PIPELINE début");
+    await tryRepair("steps-repair", maybeRepairHistoricalSteps);
+    await tryRepair("activity-calories-repair", maybeRepairHistoricalActivityCalories);
+    await tryRepair("sleep-stages-repair", maybeRepairHistoricalSleepStages);
+    await tryRepair("daily-extended-repair", maybeRepairDailyExtendedSleepWorkouts);
+    await tryRepair("scoring-90d-repair", maybeRepairScoring90dIntraday);
+    await tryRepair("recovery-rescore-repair", maybeRepairRecoveryRescore);
+
+    try {
+      const recompute = await runRecomputeWithActivityRefresh(Health, activeToken, {
+        authToken: activeToken,
+        quiet: true,
+        days: options?.recomputeDays,
+      });
+      activeToken = recompute?.token ?? activeToken;
+      if (recompute?.recompute?.ok) {
+        log(
+          `[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`,
+        );
+      } else if (forceRecompute) {
+        log(
+          `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
+        );
+      } else {
+        log("[sync-session] RECOMPUTE_SCORES skip (post-backfill — rien à recalculer)");
+      }
+      log("[sync-session] POST_BACKFILL_PIPELINE fin");
+      return { token: activeToken, recompute, forceRecompute };
+    } catch (recomputeErr) {
+      log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
+      log("[sync-session] POST_BACKFILL_PIPELINE fin (recompute échec)");
+      return { token: activeToken, recompute: null, forceRecompute };
+    }
+  }
+
   async function maybeRepairRecoveryRescore(Health, token, options) {
     if (options?.skipRecoveryRescoreRepair || options?.fullLookback) {
       return { applied: false, reason: "skipped_by_options", token };
@@ -6284,41 +6340,8 @@
             clearHistoricalCheckpoint(activeToken);
             log("Backfill arrière-plan annulé — historique déjà présent côté serveur");
             log("[sync-session] BACKFILL_ARRIÈRE_PLAN skip (serveur OK)");
-            try {
-              const recoveryRepair = await maybeRepairRecoveryRescore(Health, activeToken, {
-                manual: false,
-              });
-              activeToken = recoveryRepair?.token ?? activeToken;
-            } catch (recoveryErr) {
-              log(
-                `Réparation recovery exception: ${formatSyncError(recoveryErr, "recovery-rescore-repair")}`,
-              );
-            }
-            try {
-              const recompute = await runRecomputeWithActivityRefresh(Health, activeToken, {
-                authToken: activeToken,
-                quiet: true,
-              });
-              activeToken = recompute?.token ?? activeToken;
-              if (recompute?.recompute?.ok) {
-                log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
-              } else {
-                log(
-                  `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
-                );
-              }
-            } catch (recomputeErr) {
-              log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
-            }
-            window.setTimeout(() => {
-              if (window.PcpHealthDisplayRefresh?.scheduleRefreshAfterSync) {
-                window.PcpHealthDisplayRefresh.scheduleRefreshAfterSync({
-                  reason: "backfill-server-skip",
-                  pulse: false,
-                  retryMs: [800, 2500],
-                });
-              }
-            }, 150);
+            const pipeline = await runPostBackfillRepairPipeline(Health, activeToken, { manual: false });
+            activeToken = pipeline?.token ?? activeToken;
             return;
           }
         }
@@ -6371,47 +6394,12 @@
           clearDailyExtendedCheckpoint(activeToken);
           setSyncScopedItem(FULL_BACKFILL_KEY, String(Date.now()), activeToken);
           setHistoricalBackfillPending(activeToken, false);
-          setSyncScopedItem(DAILY_EXTENDED_SLEEP_WORKOUT_REPAIR_KEY, String(Date.now()), activeToken);
-          setSyncScopedItem(SCORING_90D_REPAIR_KEY, String(Date.now()), activeToken);
-          try {
-            const recoveryRepair = await maybeRepairRecoveryRescore(Health, activeToken, {
-              manual: false,
-            });
-            activeToken = recoveryRepair?.token ?? activeToken;
-          } catch (recoveryErr) {
-            log(
-              `Réparation recovery exception: ${formatSyncError(recoveryErr, "recovery-rescore-repair")}`,
-            );
-          }
-          try {
-            const recompute = await runRecomputeWithActivityRefresh(Health, activeToken, {
-              authToken: activeToken,
-              quiet: true,
-            });
-            activeToken = recompute?.token ?? activeToken;
-            if (recompute?.recompute?.ok) {
-              log(`[sync-session] RECOMPUTE_SCORES ok days=${recompute.recompute.days ?? RECOMPUTE_DAYS_DEFAULT}`);
-            } else {
-              log(
-                `[sync-session] RECOMPUTE_SCORES échec ${recompute?.recompute?.status ?? 0} ${recompute?.recompute?.error ?? recompute?.recompute?.reason ?? "unknown"}`,
-              );
-            }
-          } catch (recomputeErr) {
-            log(`Recompute scores exception: ${formatSyncError(recomputeErr, "recompute-scores")}`);
-          }
+          const pipeline = await runPostBackfillRepairPipeline(Health, activeToken, { manual: false });
+          activeToken = pipeline?.token ?? activeToken;
           log(
             `Backfill journalier ${DAILY_AGGREGATE_LOOKBACK_DAYS}j terminé — prochaines syncs en mode incrémental (${INCREMENTAL_LOOKBACK_HOURS}h)`,
           );
           log("[sync-session] BACKFILL_ARRIÈRE_PLAN ok");
-          window.setTimeout(() => {
-            if (window.PcpHealthDisplayRefresh?.scheduleRefreshAfterSync) {
-              window.PcpHealthDisplayRefresh.scheduleRefreshAfterSync({
-                reason: "backfill-complete",
-                pulse: false,
-                retryMs: [800, 2500],
-              });
-            }
-          }, 150);
         }
         backfillOk = allOk;
         if (!allOk) {
@@ -6799,7 +6787,11 @@
         sentAggregates,
         sync_id: lastPayload?.sync_id,
       });
-      syncFinishEvent = { ...success, manual, readyForUiRefresh: true };
+      const deferUiRefresh =
+        pendingNow ||
+        window.__pcpHealthBackfillRunning ||
+        isHistoricalBackfillPending(activeToken || token);
+      syncFinishEvent = { ...success, manual, readyForUiRefresh: !deferUiRefresh };
 
       return success;
     } catch (err) {

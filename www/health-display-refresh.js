@@ -281,14 +281,31 @@
       if (d.skipped || d.empty) return;
       if (d.ok !== true) return;
       if (d.readyForUiRefresh === false) return;
+      if (window.__pcpHealthBackfillRunning) return;
       const reason = d.manual ? "sync-manual" : "sync-auto";
       window.setTimeout(() => {
-        if (isForegroundSyncActive()) {
-          log(`refresh(${reason}) reporté — verrou sync encore actif`);
+        if (isForegroundSyncActive() || window.__pcpHealthBackfillRunning) {
+          log(`refresh(${reason}) reporté — sync/backfill encore actif`);
           return;
         }
         scheduleRefreshAfterSync({ reason });
       }, 120);
+    });
+
+    window.addEventListener("pcp-health-backfill-finished", (ev) => {
+      const d = ev?.detail || {};
+      if (d.ok !== true) return;
+      window.setTimeout(() => {
+        if (isForegroundSyncActive()) {
+          log("refresh(backfill-complete) reporté — sync premier plan actif");
+          return;
+        }
+        scheduleRefreshAfterSync({
+          reason: "backfill-complete",
+          pulse: true,
+          retryMs: [1000, 3000, 6000],
+        });
+      }, 200);
     });
 
     installRouteRefreshHook();
