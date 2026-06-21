@@ -3196,11 +3196,9 @@
 
   async function loadStagedSleepForCompanion(Health, startIso, endIsoQuery) {
     const sleepRead = await readAllSleepSamples(Health, startIso, endIsoQuery, { light: true });
-    let sleepSamples = buildSleepCompactStagedSamplesFromRaw(sleepRead.raw ?? []);
-    if (!sleepSamples.length && sleepRead.dailyRows?.length) {
-      sleepSamples = buildSleepSyntheticFromDailyRows(sleepRead.dailyRows);
-    }
-    return sleepSamples;
+    return buildSleepCompactSamplesFromRaw(sleepRead.raw ?? [], sleepRead.dailyRows ?? [], {
+      historicalLight: false,
+    });
   }
 
   async function buildRecoveryCompanionSleepForSlice(Health, slice, repairTypes) {
@@ -3227,13 +3225,10 @@
         light: !!sleepLight,
       });
       let sleepSamples = [];
-      if (historicalLight) {
-        sleepSamples = buildSleepCompactStagedSamplesFromRaw(sleepRead.raw ?? []);
-        if (!sleepSamples.length && sleepRead.dailyRows?.length) {
-          sleepSamples = buildSleepSyntheticFromDailyRows(sleepRead.dailyRows);
-        }
-      } else if (sleepRead.dailyRows?.length) {
-        sleepSamples = buildSleepSyntheticFromDailyRows(sleepRead.dailyRows);
+      if (historicalLight || sleepRead.dailyRows?.length || sleepRead.raw?.length) {
+        sleepSamples = buildSleepCompactSamplesFromRaw(sleepRead.raw ?? [], sleepRead.dailyRows ?? [], {
+          historicalLight,
+        });
       } else if (sleepRead.normalized?.length) {
         sleepSamples = sleepRead.normalized;
       }
@@ -3492,7 +3487,7 @@
     return out;
   }
 
-  /** 1 sample/nuit (durée totale) — suffisant pour sleep_min backend (pas de stades). */
+  /** 1 sample/nuit (durée totale @ midi) — repli si HK ne fournit pas d'intervalles exploitables. */
   function buildSleepSyntheticFromDailyRows(dailyRows) {
     const samples = [];
     for (const row of dailyRows ?? []) {
@@ -3512,6 +3507,159 @@
       if (norm) samples.push(norm);
     }
     return samples;
+  }
+
+  /**
+   * Fenêtre horaire + durée endormie depuis bruts HK d'une nuit (1 source).
+   * Horaires = min(start)→max(end) réels (y compris inBed sans stades).
+   * Durée = intervalles endormis fusionnés, sinon total agrégé Santé.
+   */
+  function collectSleepNightMetrics(rawList, dailyByDay) {
+    const asleepIntervals = [];
+    let windowMinStart = Infinity;
+    let windowMaxEnd = -Infinity;
+    let hasWindow = false;
+
+    for (const raw of rawList ?? []) {
+      const state = normalizeSleepToken(raw?.sleepState ?? raw?.sleep_state);
+      if (state.includes("awake")) continue;
+
+      const asleep = extractSleepIntervalsFromRaw(raw);
+      for (const iv of asleep) {
+        asleepIntervals.push(iv);
+        windowMinStart = Math.min(windowMinStart, iv.startMs);
+        windowMaxEnd = Math.max(windowMaxEnd, iv.endMs);
+        hasWindow = true;
+      }
+      if (asleep.length) continue;
+
+      const iv = sleepSampleInterval(raw);
+      if (!iv) continue;
+      windowMinStart = Math.min(windowMinStart, iv.startMs);
+      windowMaxEnd = Math.max(windowMaxEnd, iv.endMs);
+      hasWindow = true;
+    }
+
+    if (!hasWindow) return null;
+
+    const wakeDay = localDayKey(new Date(windowMaxEnd).toISOString());
+    const asleepMs = mergedIntervalMs(asleepIntervals);
+    const aggMin = wakeDay && dailyByDay?.get(wakeDay) ? Math.round(dailyByDay.get(wakeDay)) : 0;
+    let asleepMin = asleepMs > 0 ? Math.round(asleepMs / 60000) : 0;
+    if (asleepMin <= 0 && aggMin > 0) asleepMin = aggMin;
+    if (asleepMin <= 0) {
+      asleepMin = Math.round((windowMaxEnd - windowMinStart) / 60000);
+    }
+    if (!wakeDay || asleepMin <= 0) return null;
+
+    return {
+      wakeDay,
+      asleepMin,
+      startDate: new Date(windowMinStart).toISOString(),
+      endDate: new Date(windowMaxEnd).toISOString(),
+    };
+  }
+
+  /**
+   * 1 sample/nuit avec vrais horaires HK (pas de midi synthétique).
+   * value = minutes endormies (fusionnées ou agrégat Santé).
+   */
+  function buildSleepRealIntervalSamplesFromRaw(rawList, dailyRows) {
+    if (!Array.isArray(rawList) || rawList.length === 0) return [];
+
+    const dailyByDay = new Map();
+    for (const row of dailyRows ?? []) {
+      const mins = Math.round(toNum(row?.sleep_total_min) ?? 0);
+      if (row?.day && mins > 0) dailyByDay.set(row.day, mins);
+    }
+
+    const nights = clusterSleepRawIntoNights(rawList);
+    const out = [];
+
+    for (const nightSamples of nights) {
+      const bySrc = new Map();
+      for (const raw of nightSamples) {
+        const src = String(raw?.sourceName ?? raw?.sourceId ?? "unknown");
+        if (!bySrc.has(src)) bySrc.set(src, []);
+        bySrc.get(src).push(raw);
+      }
+
+      let bestMetrics = null;
+      let bestPri = -1;
+      let bestSource = "healthkit";
+
+      for (const [src, list] of bySrc) {
+        const metrics = collectSleepNightMetrics(list, dailyByDay);
+        if (!metrics) continue;
+        const pri = sleepSourcePriority(src);
+        if (
+          !bestMetrics ||
+          pri > bestPri ||
+          (pri === bestPri && metrics.asleepMin > bestMetrics.asleepMin)
+        ) {
+          bestPri = pri;
+          bestMetrics = metrics;
+          bestSource = src;
+        }
+      }
+
+      if (!bestMetrics) continue;
+
+      const norm = buildSleepStageSample(
+        { sourceName: bestSource },
+        null,
+        bestMetrics.startDate,
+        bestMetrics.endDate,
+        `sleep|compact|${bestMetrics.wakeDay}`,
+        "night",
+      );
+      if (norm) {
+        norm.value = bestMetrics.asleepMin;
+        out.push(norm);
+      }
+    }
+
+    return out;
+  }
+
+  /** REM / Deep / Core — pas le seul bucket générique « Asleep » sans détail HK. */
+  function hasDetailedSleepStages(samples) {
+    for (const s of samples ?? []) {
+      const bucket = canonicalSleepStageBucket(s.stage);
+      if (bucket === "REM" || bucket === "Deep" || bucket === "Core") return true;
+    }
+    return false;
+  }
+
+  /**
+   * historicalLight → stades compacts si dispo (réparateur j 8–60).
+   * incremental compact → intervalles réels sauf vrais stades REM/Deep/Core.
+   */
+  function buildSleepCompactSamplesFromRaw(rawList, dailyRows, options = {}) {
+    const historicalLight = options.historicalLight === true;
+    const staged = buildSleepCompactStagedSamplesFromRaw(rawList ?? []);
+    if (staged.length && (historicalLight || hasDetailedSleepStages(staged))) {
+      return staged;
+    }
+    const real = buildSleepRealIntervalSamplesFromRaw(rawList ?? [], dailyRows ?? []);
+    if (real.length) return real;
+    if (staged.length) return staged;
+    return buildSleepSyntheticFromDailyRows(dailyRows ?? []);
+  }
+
+  function describeSleepCompactPostMode(samples) {
+    if (!samples?.length) return "aucun";
+    if (samples.some((s) => String(s.platformId ?? "").startsWith("sleep|compact|"))) {
+      return "intervalles réels";
+    }
+    if (hasDetailedSleepStages(samples)) return "stades compacts";
+    if (samples.some((s) => String(s.platformId ?? "").startsWith("sleep|hist|"))) {
+      return "asleep générique";
+    }
+    if (samples.some((s) => String(s.platformId ?? "").startsWith("sleep|agg|"))) {
+      return "synthétique";
+    }
+    return "autre";
   }
 
   /**
@@ -3952,7 +4100,9 @@
           if (localSleepRows.length > 0) {
             sleepDailyRows = localSleepRows;
             log(`  daily-extended sommeil: ${localSleepRows.length} nuit(s) agrégées`);
-            const sleepSamples = buildSleepSyntheticFromDailyRows(localSleepRows);
+            const sleepSamples = buildSleepCompactSamplesFromRaw(sleepRead.raw ?? [], localSleepRows, {
+              historicalLight: false,
+            });
             if (sleepSamples.length > 0) {
               totalSamples += sleepSamples.length;
               const sleepPost = await postSampleBlock("sleep", {
@@ -4175,22 +4325,13 @@
           localSleepRows = sleepRead.dailyRows;
           if (sleepCompact) {
             const compactLabel = historicalLight ? "léger" : "compact";
-            if (historicalLight) {
-              samples = buildSleepCompactStagedSamplesFromRaw(sleepRead.raw);
-              const nights = clusterSleepRawIntoNights(sleepRead.raw ?? []).length;
-              log(
-                `  sleep (${compactLabel}): ${sleepRead.raw?.length ?? 0} bruts → ${samples.length} segment(s) stades compacts (${nights} nuit(s))`,
-              );
-              if (samples.length === 0 && localSleepRows.length > 0) {
-                log(`  sleep ${compactLabel}: repli synthétique durée (${localSleepRows.length} nuit(s))`);
-                samples = buildSleepSyntheticFromDailyRows(localSleepRows);
-              }
-            } else {
-              samples = buildSleepSyntheticFromDailyRows(localSleepRows);
-              log(
-                `  sleep (${compactLabel}): ${sleepRead.raw?.length ?? 0} bruts → ${samples.length} nuit(s) synthétique(s)`,
-              );
-            }
+            samples = buildSleepCompactSamplesFromRaw(sleepRead.raw ?? [], localSleepRows, {
+              historicalLight,
+            });
+            const nights = clusterSleepRawIntoNights(sleepRead.raw ?? []).length;
+            log(
+              `  sleep (${compactLabel}): ${sleepRead.raw?.length ?? 0} bruts → ${samples.length} sample(s) (${describeSleepCompactPostMode(samples)}${nights ? `, ${nights} nuit(s) HK` : ""})`,
+            );
             if (samples.length === 0 && sleepRead.raw?.length > 0) {
               log(`  sleep ${compactLabel}: repli segments bruts (${sleepRead.raw.length} HK)`);
               for (const r of sleepRead.raw) {
