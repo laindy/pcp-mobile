@@ -1,5 +1,8 @@
 /**
  * Hook Android — swipe sync manuel, coaching futuriste, toasts (parité iOS).
+ *
+ * Compaction / platform_id stables : HealthSyncRepository + HistoricalLightCompactor.kt
+ * (aligné health-ios-sync.js — IDs |agg|, sleep|compact|*, upsert backend Lucas).
  */
 (function () {
   if (window.__pcpAndroidHealthHook) return;

@@ -10,6 +10,13 @@ import kotlin.math.round
 /**
  * Mode historique léger (jours 8–60) et incrémental compact — parité iOS
  * [health-ios-sync.js] collapseVitalSamplesToDailySynthetic + sleep stades compacts.
+ *
+ * IDs stables pour upsert backend (Lucas) :
+ * - `{type}|agg|{wakeDay}` — vitaux compacts
+ * - `sleep|compact|{wakeDay}::night` — sommeil incrémental (intervalles réels)
+ * - `sleep|hist|{wakeDay}::{bucket}|{idx}` — sommeil historique stagé
+ * - `sleep|agg|{day}::night` — repli synthétique
+ * - `sleep|companion|{wakeDay}::companion`
  */
 object HistoricalLightCompactor {
 
@@ -29,9 +36,8 @@ object HistoricalLightCompactor {
     fun isIncrementalCompact(phaseLabel: String): Boolean =
         phaseLabel in INCREMENTAL_COMPACT
 
-    /** Vitaux bruts sur sync incrémentale / récente — compaction uniquement historique 8–60j. */
     fun useVitalCompact(phaseLabel: String): Boolean =
-        isHistoricalLight(phaseLabel)
+        isHistoricalLight(phaseLabel) || isIncrementalCompact(phaseLabel)
 
     fun useSleepCompact(phaseLabel: String): Boolean =
         useVitalCompact(phaseLabel)
@@ -48,7 +54,7 @@ object HistoricalLightCompactor {
         Log.i(TAG, "Phase $phaseLabel — mode $label")
 
         val sleepRaw = samplesByType["sleep"] ?: emptyList()
-        val nightIndex = buildWakeDayNightTimestampIndex(sleepRaw, dailyByDay, zone, isHistoricalLight(phaseLabel))
+        val nightIndex = buildWakeDayNightTimestampIndex(sleepRaw, dailyByDay, zone, phaseLabel)
 
         for (type in VITAL_COMPACT_TYPES) {
             val raw = samplesByType[type] ?: continue
@@ -74,18 +80,20 @@ object HistoricalLightCompactor {
 
         if (sleepRaw.isEmpty()) return
 
-        val compacted = if (isHistoricalLight(phaseLabel)) {
-            compactSleepStagedHistorical(sleepRaw, zone)
-        } else {
-            buildSleepSyntheticFromDaily(dailyByDay, zone)
-        }
+        val compacted = buildSleepCompactSamplesFromRaw(
+            sleepRaw,
+            dailyByDay,
+            zone,
+            historicalLight = isHistoricalLight(phaseLabel),
+        )
 
         if (compacted.isNotEmpty()) {
-            val nights = if (isHistoricalLight(phaseLabel)) countSleepNights(sleepRaw, zone) else dailyByDay.size
+            val nights = clusterSleepIntoNights(sleepRaw.filter { !it.stage.isNullOrBlank() }, zone).size
+            val mode = describeSleepCompactPostMode(compacted)
             Log.i(
                 TAG,
-                "  sleep ($label): ${sleepRaw.size} bruts → ${compacted.size} segment(s)" +
-                    if (isHistoricalLight(phaseLabel)) " ($nights nuit(s))" else " synthétique(s)",
+                "  sleep ($label): ${sleepRaw.size} bruts → ${compacted.size} sample(s) ($mode" +
+                    if (nights > 0) ", $nights nuit(s) HK)" else ")",
             )
             samplesByType["sleep"] = compacted.toMutableList()
         } else if (sleepRaw.isNotEmpty()) {
@@ -131,14 +139,14 @@ object HistoricalLightCompactor {
                 endAt = instant,
                 sourceId = "health_connect",
                 sourceName = "health_connect",
-                platformId = "${dataType}|agg|$wakeDay|$rounded".take(255),
+                platformId = "${dataType}|agg|$wakeDay".take(255),
                 origin = list.firstOrNull { it.origin != null }?.origin,
             )
         }
         return out
     }
 
-    private fun vitalWakeDay(instant: Instant, zone: ZoneId): LocalDate {
+    fun vitalWakeDay(instant: Instant, zone: ZoneId): LocalDate {
         val zdt = instant.atZone(ZoneOffset.UTC)
         val localDay = instant.atZone(zone).toLocalDate()
         val h = zdt.hour
@@ -162,10 +170,15 @@ object HistoricalLightCompactor {
         sleepRaw: List<SamplePoint>,
         dailyByDay: Map<LocalDate, DailyAggregate>,
         zone: ZoneId,
-        historicalLight: Boolean,
+        phaseLabel: String,
     ): Map<LocalDate, Instant> {
-        val staged = if (historicalLight) {
-            compactSleepStagedHistorical(sleepRaw, zone)
+        val staged = if (useSleepCompact(phaseLabel)) {
+            buildSleepCompactSamplesFromRaw(
+                sleepRaw,
+                dailyByDay,
+                zone,
+                historicalLight = isHistoricalLight(phaseLabel),
+            )
         } else {
             buildSleepSyntheticFromDaily(dailyByDay, zone)
         }
@@ -187,9 +200,6 @@ object HistoricalLightCompactor {
     fun vitalWakeDayFromInstant(instant: Instant, zone: ZoneId): LocalDate =
         vitalWakeDay(instant, zone)
 
-    /**
-     * 1 segment sommeil par jour de réveil des vitaux réparés — attribution nocturne backend.
-     */
     fun buildCompanionSleepForWakeDays(
         wakeDays: Set<LocalDate>,
         sleepRaw: List<SamplePoint>,
@@ -219,18 +229,105 @@ object HistoricalLightCompactor {
             val endAt = wakeDay.atTime(10, 0).toInstant(ZoneOffset.UTC)
             val mins = (endAt.epochSecond - startAt.epochSecond) / 60.0
             if (mins <= 0) continue
-            out += SamplePoint(
-                dataType = "sleep",
-                value = mins,
-                unit = "minute",
+            out += buildSleepStageSample(
+                sourceName = "health_connect",
+                sourceId = "health_connect",
+                stage = "asleep",
                 startAt = startAt,
                 endAt = endAt,
-                sourceName = "healthkit",
-                platformId = "sleep|companion|$wakeDay".take(255),
-                stage = "asleep",
-            )
+                parentPlatformId = "sleep|companion|$wakeDay",
+                segmentKey = "companion",
+            ) ?: continue
         }
         return out
+    }
+
+    /**
+     * historicalLight → stades compacts si REM/Deep/Core.
+     * incremental → intervalles réels sauf vrais stades détaillés.
+     */
+    fun buildSleepCompactSamplesFromRaw(
+        rawList: List<SamplePoint>,
+        dailyByDay: Map<LocalDate, DailyAggregate>,
+        zone: ZoneId,
+        historicalLight: Boolean,
+    ): List<SamplePoint> {
+        if (rawList.isEmpty()) return emptyList()
+        val staged = compactSleepStagedHistorical(rawList, zone)
+        if (staged.isNotEmpty() && (historicalLight || hasDetailedSleepStages(staged))) {
+            return staged
+        }
+        val real = buildSleepRealIntervalSamplesFromRaw(rawList, dailyByDay, zone)
+        if (real.isNotEmpty()) return real
+        return buildSleepSyntheticFromDaily(dailyByDay, zone)
+    }
+
+    private fun hasDetailedSleepStages(samples: List<SamplePoint>): Boolean {
+        for (s in samples) {
+            when (canonicalSleepStageBucket(s.stage)) {
+                "REM", "Deep", "Core" -> return true
+            }
+        }
+        return false
+    }
+
+    private fun describeSleepCompactPostMode(samples: List<SamplePoint>): String {
+        if (samples.isEmpty()) return "vide"
+        val pid = samples.first().platformId
+        return when {
+            pid.contains("sleep|compact|") -> "intervalles réels"
+            pid.contains("sleep|hist|") -> "stades compacts"
+            pid.contains("sleep|agg|") -> "synthétique"
+            else -> "brut"
+        }
+    }
+
+    private fun canonicalSleepStageBucket(stageName: String?): String {
+        val n = (stageName ?: "").lowercase().replace("_", "").replace(" ", "")
+        if (n.isEmpty()) return "Asleep"
+        if (n.contains("rem")) return "REM"
+        if (n.contains("deep")) return "Deep"
+        if (n.contains("core") || n.contains("light")) return "Core"
+        if (n.contains("awake")) return "Awake"
+        if (n.contains("inbed")) return "InBed"
+        if (n.contains("asleep") || n.contains("sleeping")) return "Asleep"
+        return stageName ?: "Asleep"
+    }
+
+    private fun sleepSourcePriority(label: String?): Int {
+        val n = (label ?: "").lowercase()
+        return when {
+            n.contains("watch") -> 3
+            n.contains("wear") -> 3
+            n.contains("phone") -> 2
+            else -> 1
+        }
+    }
+
+    private fun buildSleepStageSample(
+        sourceName: String?,
+        sourceId: String?,
+        stage: String?,
+        startAt: Instant,
+        endAt: Instant,
+        parentPlatformId: String,
+        segmentKey: String,
+    ): SamplePoint? {
+        if (!endAt.isAfter(startAt)) return null
+        val mins = (endAt.epochSecond - startAt.epochSecond) / 60.0
+        if (mins < 0.01) return null
+        val platformId = "${parentPlatformId.take(200)}::$segmentKey".take(255)
+        return SamplePoint(
+            dataType = "sleep",
+            value = mins,
+            unit = "minute",
+            startAt = startAt,
+            endAt = endAt,
+            sourceId = sourceId,
+            sourceName = sourceName,
+            platformId = platformId,
+            stage = stage,
+        )
     }
 
     /** Historique : fusion par stade/nuit avec horaires réels (REM+Deep pour scoring). */
@@ -245,30 +342,136 @@ object HistoricalLightCompactor {
         val out = mutableListOf<SamplePoint>()
 
         for (nightSamples in nights) {
-            val wakeDay = nightSamples.maxOfOrNull { instantToLocalDate(it.endAt, zone) } ?: continue
-            val byStage = nightSamples.groupBy { it.stage!! }
+            val bySrc = nightSamples.groupBy { it.sourceName ?: it.sourceId ?: "unknown" }
+            var bestList = nightSamples
+            var bestPri = -1
+            for ((src, list) in bySrc) {
+                val pri = sleepSourcePriority(src)
+                if (pri > bestPri) {
+                    bestPri = pri
+                    bestList = list
+                }
+            }
 
-            for ((stage, segs) in byStage) {
+            var wakeDay: LocalDate? = null
+            for (s in bestList) {
+                val d = instantToLocalDate(s.endAt, zone)
+                if (wakeDay == null || d.isAfter(wakeDay)) wakeDay = d
+            }
+            val wake = wakeDay ?: continue
+
+            val byBucket = bestList.groupBy { canonicalSleepStageBucket(it.stage) }
+            for ((bucket, segs) in byBucket) {
                 val merged = mergeAdjacentSegments(segs)
                 merged.forEachIndexed { idx, seg ->
-                    val mins = (seg.endAt.epochSecond - seg.startAt.epochSecond) / 60.0
-                    if (mins <= 0) return@forEachIndexed
-                    val pid = "sleep|hist|$wakeDay|$stage|$idx".take(255)
-                    out += SamplePoint(
-                        dataType = "sleep",
-                        value = mins,
-                        unit = "minute",
+                    val sample = buildSleepStageSample(
+                        sourceName = seg.sourceName,
+                        sourceId = seg.sourceId,
+                        stage = bucket,
                         startAt = seg.startAt,
                         endAt = seg.endAt,
-                        sourceId = seg.sourceId,
-                        sourceName = seg.sourceName,
-                        platformId = pid,
-                        stage = stage,
-                    )
+                        parentPlatformId = "sleep|hist|$wake",
+                        segmentKey = "$bucket|$idx",
+                    ) ?: return@forEachIndexed
+                    out += sample
                 }
             }
         }
         return out
+    }
+
+    /** 1 sample/nuit avec vrais horaires HC (pas de midi synthétique). */
+    private fun buildSleepRealIntervalSamplesFromRaw(
+        rawList: List<SamplePoint>,
+        dailyByDay: Map<LocalDate, DailyAggregate>,
+        zone: ZoneId,
+    ): List<SamplePoint> {
+        val nights = clusterSleepIntoNights(rawList.filter { !it.stage.isNullOrBlank() }.ifEmpty { rawList }, zone)
+        val out = mutableListOf<SamplePoint>()
+
+        for (nightSamples in nights) {
+            val bySrc = nightSamples.groupBy { it.sourceName ?: it.sourceId ?: "unknown" }
+            var bestMetrics: NightMetrics? = null
+            var bestPri = -1
+            var bestSource = "health_connect"
+
+            for ((src, list) in bySrc) {
+                val metrics = collectSleepNightMetrics(list, dailyByDay, zone) ?: continue
+                val pri = sleepSourcePriority(src)
+                if (
+                    bestMetrics == null ||
+                    pri > bestPri ||
+                    (pri == bestPri && metrics.asleepMin > bestMetrics.asleepMin)
+                ) {
+                    bestPri = pri
+                    bestMetrics = metrics
+                    bestSource = src
+                }
+            }
+
+            val m = bestMetrics ?: continue
+            val sample = buildSleepStageSample(
+                sourceName = bestSource,
+                sourceId = bestSource,
+                stage = null,
+                startAt = m.startAt,
+                endAt = m.endAt,
+                parentPlatformId = "sleep|compact|${m.wakeDay}",
+                segmentKey = "night",
+            ) ?: continue
+            out += sample.copy(value = m.asleepMin.toDouble())
+        }
+        return out
+    }
+
+    private data class NightMetrics(
+        val wakeDay: LocalDate,
+        val asleepMin: Int,
+        val startAt: Instant,
+        val endAt: Instant,
+    )
+
+    private fun collectSleepNightMetrics(
+        nightSamples: List<SamplePoint>,
+        dailyByDay: Map<LocalDate, DailyAggregate>,
+        zone: ZoneId,
+    ): NightMetrics? {
+        var windowMinStart: Instant? = null
+        var windowMaxEnd: Instant? = null
+        var asleepMin = 0.0
+
+        for (s in nightSamples) {
+            if (!SleepNightAttribution.isAsleepStage(s.stage)) {
+                if (s.stage.isNullOrBlank() && s.value > 0) {
+                    val start = s.startAt
+                    val end = s.endAt
+                    if (windowMinStart == null || start.isBefore(windowMinStart)) windowMinStart = start
+                    if (windowMaxEnd == null || end.isAfter(windowMaxEnd)) windowMaxEnd = end
+                    asleepMin += s.value
+                }
+                continue
+            }
+            if (!s.endAt.isAfter(s.startAt)) continue
+            val start = s.startAt
+            val end = s.endAt
+            if (windowMinStart == null || start.isBefore(windowMinStart)) windowMinStart = start
+            if (windowMaxEnd == null || end.isAfter(windowMaxEnd)) windowMaxEnd = end
+            asleepMin += s.value
+        }
+
+        val minStart = windowMinStart ?: return null
+        val maxEnd = windowMaxEnd ?: return null
+        val wakeDay = instantToLocalDate(maxEnd, zone)
+
+        var mins = asleepMin.toInt()
+        val aggMin = dailyByDay[wakeDay]?.sleepTotalMin ?: 0
+        if (mins <= 0 && aggMin > 0) mins = aggMin
+        if (mins <= 0) {
+            mins = ((maxEnd.epochSecond - minStart.epochSecond) / 60).toInt()
+        }
+        if (mins <= 0) return null
+
+        return NightMetrics(wakeDay, mins, minStart, maxEnd)
     }
 
     private data class TimeSegment(
@@ -329,10 +532,7 @@ object HistoricalLightCompactor {
         return nights
     }
 
-    private fun countSleepNights(samples: List<SamplePoint>, zone: ZoneId): Int =
-        clusterSleepIntoNights(samples.filter { !it.stage.isNullOrBlank() }, zone).size
-
-    /** Incrémental : 1 sample/nuit (durée totale @ midi). */
+    /** Incrémental : repli 1 sample/nuit (durée totale @ midi). */
     private fun buildSleepSyntheticFromDaily(
         dailyByDay: Map<LocalDate, DailyAggregate>,
         zone: ZoneId,
@@ -343,16 +543,16 @@ object HistoricalLightCompactor {
             if (mins <= 0) continue
             val start = day.atTime(12, 0).atZone(zone).toInstant()
             val end = start.plusSeconds(mins.toLong() * 60)
-            out += SamplePoint(
-                dataType = "sleep",
-                value = mins.toDouble(),
-                unit = "minute",
+            val sample = buildSleepStageSample(
+                sourceName = "health_connect",
+                sourceId = "health_connect",
+                stage = null,
                 startAt = start,
                 endAt = end,
-                sourceId = "health_connect",
-                sourceName = "health_connect",
-                platformId = "sleep|agg|$day|$mins".take(255),
-            )
+                parentPlatformId = "sleep|agg|$day",
+                segmentKey = "night",
+            ) ?: continue
+            out += sample
         }
         return out
     }

@@ -74,7 +74,7 @@ object RecoveryRescoreExecutor {
                 sleepRaw,
                 ctx.dailyByDay,
                 zone,
-                historicalLight = true,
+                phaseLabel = "historical",
             )
 
             val merged = linkedMapOf<String, List<SamplePoint>>()
