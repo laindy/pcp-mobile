@@ -2,6 +2,7 @@ package com.pcpinnov.pcpttherapy.health
 
 import android.util.Log
 import java.time.Instant
+import java.time.ZoneId
 import java.util.UUID
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -65,24 +66,38 @@ object HealthSyncStreaming {
         val end = Instant.ofEpochMilli(phase.endMs)
         val phaseLabel = phase.label
         val historicalLight = HistoricalLightCompactor.isHistoricalLight(phaseLabel)
+        val incrementalCompact = HistoricalLightCompactor.isIncrementalCompact(phaseLabel)
         val deferPosts = historicalLight
 
         val ctx = repository.beginCollectContext()
         Log.i(
             TAG,
             "Pipeline ($phaseLabel) — lecture ∥$READ_CONCURRENCY" +
-                if (historicalLight) ", historique léger" else ", POST streaming",
+                when {
+                    historicalLight -> ", historique léger"
+                    incrementalCompact -> ", incrémental compact"
+                    else -> ", POST streaming"
+                },
         )
 
         repository.readDailyAggregates(ctx, start, end)
 
-        val scoring = repository.buildScoringSamples(ctx.dailyByDay)
+        val sleepPreRead = repository.readSampleType(ctx, "sleep", start, end)
+        SleepNightAttribution.applyWakeDayTotals(ctx.dailyByDay, sleepPreRead, ZoneId.systemDefault())
+        val nightIndex = HistoricalLightCompactor.buildWakeDayNightTimestampIndex(
+            sleepPreRead,
+            ctx.dailyByDay,
+            ZoneId.systemDefault(),
+            phaseLabel,
+        )
+
+        val scoring = repository.buildScoringSamples(ctx.dailyByDay, nightIndex)
         val earlyOverlay = ScoreRingDailyFilter.filterDailyAggregates(
             ctx.dailyByDay.values.filter { it.hasActivitySignal() },
         ).sortedBy { it.day }
 
         if (!deferPosts) {
-            for (type in listOf("steps", "calories")) {
+            for (type in listOf("steps", "calories", "restingHeartRate")) {
                 val samples = scoring[type] ?: continue
                 if (samples.isEmpty()) continue
                 val payload = repository.buildPartialPayload(
@@ -105,15 +120,15 @@ object HealthSyncStreaming {
             }
         }
 
-        val sampleTypes = listOf(
-            "restingHeartRate",
-            "heartRateVariability",
-            "respiratoryRate",
-            "oxygenSaturation",
-            "bodyTemperature",
-            "vo2Max",
-            "sleep",
-        )
+        val sampleTypes = buildList {
+            if (!incrementalCompact) add("restingHeartRate")
+            add("heartRateVariability")
+            add("respiratoryRate")
+            add("oxygenSaturation")
+            add("bodyTemperature")
+            add("vo2Max")
+            // sleep lu une fois (nightIndex) — pas de 2e lecture HC
+        }
 
         val semaphore = Semaphore(READ_CONCURRENCY)
         val typeSamples = coroutineScope {
@@ -134,6 +149,7 @@ object HealthSyncStreaming {
         typeSamples.forEach { (type, list) ->
             if (list.isNotEmpty()) merged.getOrPut(type) { mutableListOf() }.addAll(list)
         }
+        if (sleepPreRead.isNotEmpty()) merged["sleep"] = sleepPreRead.toMutableList()
         if (hrWorkout.isNotEmpty()) merged["heartRate"] = hrWorkout.toMutableList()
 
         repository.finalizeSamples(ctx, merged, phaseLabel)
@@ -220,13 +236,20 @@ object HealthSyncStreaming {
 
         repository.readDailyAggregates(ctx, start, end)
         repository.enrichDailyWithSleep(ctx, start, end)
+        val sleepRaw = repository.readSampleType(ctx, "sleep", start, end)
+        val nightIndex = HistoricalLightCompactor.buildWakeDayNightTimestampIndex(
+            sleepRaw,
+            ctx.dailyByDay,
+            ZoneId.systemDefault(),
+            phaseLabel = "daily-extended",
+        )
         val vitalSamples = repository.readDailyExtendedVitalsCompact(ctx, start, end)
-        val scoring = repository.buildScoringSamples(ctx.dailyByDay)
+        val scoring = repository.buildScoringSamples(ctx.dailyByDay, nightIndex)
         val dailyOverlay = ScoreRingDailyFilter.filterDailyAggregates(
             ctx.dailyByDay.values.filter { it.hasAnyValue() },
         ).sortedBy { it.day }
 
-        for (type in listOf("steps", "calories")) {
+        for (type in listOf("steps", "calories", "restingHeartRate")) {
             val samples = scoring[type] ?: continue
             if (samples.isEmpty()) continue
             val payload = repository.buildPartialPayload(

@@ -27,6 +27,7 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.Period
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.Locale
 import kotlin.math.roundToInt
 import kotlinx.coroutines.async
@@ -754,7 +755,8 @@ class HealthSyncRepository(private val context: Context) {
         val raw = if (nativeId.isNotBlank()) {
             "$type|${metadata.dataOrigin.packageName}|$nativeId"
         } else {
-            "$type|${metadata.dataOrigin.packageName}|$epochMs|$value"
+            // Pas de valeur dans l'ID — stable pour upsert backend (parité iOS resolvePlatformId).
+            "$type|${metadata.dataOrigin.packageName}|$epochMs"
         }
         return if (raw.length > 255) raw.take(255) else raw
     }
@@ -795,7 +797,29 @@ class HealthSyncRepository(private val context: Context) {
                     fillCaloriesFromRecords(start, end, ctx.dailyByDay)
                 }
             },
+            async {
+                runRead(ctx, "restingHeartRate", HealthPermission.getReadPermission(RestingHeartRateRecord::class)) {
+                    fillRestingHrAveragesFromRecords(start, end, ctx.dailyByDay)
+                }
+            },
         )
+    }
+
+    /** Moyenne journalière FC repos (parité iOS queryAggregated restingHeartRate). */
+    private suspend fun fillRestingHrAveragesFromRecords(
+        start: Instant,
+        end: Instant,
+        dailyByDay: MutableMap<LocalDate, DailyAggregate>,
+    ) {
+        val byDay = mutableMapOf<LocalDate, MutableList<Double>>()
+        readRecords<RestingHeartRateRecord>(start, end).forEach { record ->
+            val day = instantToLocalDate(record.time)
+            byDay.getOrPut(day) { mutableListOf() }.add(record.beatsPerMinute.toDouble())
+        }
+        byDay.forEach { (day, vals) ->
+            if (vals.isEmpty()) return@forEach
+            daily(day, dailyByDay).restingHeartRateAvg = (vals.average() * 100.0).roundToInt() / 100.0
+        }
     }
 
     /** Sommeil → sleep_total_min sur dailyByDay (attribution jour de réveil). */
@@ -819,7 +843,7 @@ class HealthSyncRepository(private val context: Context) {
             sleepRaw,
             ctx.dailyByDay,
             zone,
-            historicalLight = false,
+            phaseLabel = "daily-extended",
         )
         val out = linkedMapOf<String, List<SamplePoint>>()
         val types = listOf(
@@ -843,10 +867,14 @@ class HealthSyncRepository(private val context: Context) {
         return out
     }
 
-    fun buildScoringSamples(dailyByDay: Map<LocalDate, DailyAggregate>): Map<String, List<SamplePoint>> {
+    fun buildScoringSamples(
+        dailyByDay: Map<LocalDate, DailyAggregate>,
+        nightIndex: Map<LocalDate, Instant> = emptyMap(),
+    ): Map<String, List<SamplePoint>> {
         val out = mutableMapOf<String, MutableList<SamplePoint>>()
         for (row in dailyByDay.values) {
             if (ScoreRingDailyFilter.isFutureDay(row.day, zone)) continue
+            if (!ScoreRingDailyFilter.isPostableDailyRow(row, zone)) continue
             val steps = row.stepsTotal
             if (steps != null && steps > 0L) {
                 val noon = row.day.atTime(12, 0).atZone(zone).toInstant()
@@ -878,6 +906,23 @@ class HealthSyncRepository(private val context: Context) {
                         sourceId = "health_connect",
                         sourceName = "health_connect",
                         platformId = "calories|agg|${row.day}",
+                    ),
+                )
+            }
+            val rhr = row.restingHeartRateAvg
+            if (rhr != null && rhr > 0.0) {
+                val nightAt = nightIndex[row.day] ?: row.day.atTime(4, 0).toInstant(ZoneOffset.UTC)
+                addSample(
+                    out,
+                    SamplePoint(
+                        dataType = "restingHeartRate",
+                        value = rhr,
+                        unit = "bpm",
+                        startAt = nightAt,
+                        endAt = nightAt,
+                        sourceId = "health_connect",
+                        sourceName = "health_connect",
+                        platformId = "restingHeartRate|agg|${row.day}",
                     ),
                 )
             }
